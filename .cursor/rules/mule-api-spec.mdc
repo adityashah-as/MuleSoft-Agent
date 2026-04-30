@@ -1,0 +1,67 @@
+---
+description: RAML 1.0 / OAS 3.0 API specification standards for MuleSoft
+globs: **/src/main/resources/api/**
+alwaysApply: false
+---
+
+# API Specification (RAML / OAS) Rules
+
+## Workflow
+
+Always design the API spec **BEFORE** implementing the flow:
+
+1. Write/extend the RAML or OAS file in `src/main/resources/api/`
+2. Validate it with `MuleSoft: Validate Project` in Anypoint Code Builder
+3. Use the ACB editor's preview / `MuleSoft: Open API Console` to sanity-check it
+4. THEN implement the corresponding Mule flow (see `mule-flow-generation.mdc`)
+5. Keep spec and flow paths/methods/types in sync at all times
+
+## Format
+
+- **RAML 1.0** is the default for MuleSoft (best tooling support).
+- **OAS 3.0** (JSON or YAML) is acceptable when the consumer requires it.
+- File location: `src/main/resources/api/<api-name>.raml` (or `.yaml`/`.json`).
+
+## Required Per Resource
+
+Every resource (endpoint) must declare:
+
+- **Request body** type with at least one `example` (for non-GET methods)
+- **Responses** for `200`/`201` AND every realistic error: `400`, `404`, `409` (where applicable), `500`
+- **Headers** that the flow actually reads (e.g. `X-Correlation-Id`, `Authorization`)
+- **Query parameters** with type, description, `required` flag, and example
+
+## Required Per Type
+
+Every type must declare:
+
+- All properties with `type`, `description`, `required` flag
+- An `example` value on every property
+- `default` values where it makes sense
+- **Separate input vs full types**: e.g. `CustomerInput` (request body, no `id`) vs `Customer` (response, includes generated `id`, `createdAt`)
+
+## Standard Error Response
+
+Use the same shape across every spec in the project:
+
+```yaml
+ErrorResponse:
+  type: object
+  properties:
+    code:
+      type: string
+      example: "NOT_FOUND"
+    message:
+      type: string
+      example: "Customer with id 123 not found"
+```
+
+## Versioning
+
+The version segment (`v1`, `v2`, …) MUST match across:
+
+- RAML/OAS `baseUri` / `servers`
+- The Mule `<http:listener>` `path`
+- `config.yaml` → `http.basePath`
+
+If you change the version, update all three.

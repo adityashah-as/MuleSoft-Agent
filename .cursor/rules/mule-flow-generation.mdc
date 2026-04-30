@@ -1,0 +1,256 @@
+---
+description: Mule 4 flow & sub-flow XML standards (hand-written)
+globs: **/src/main/mule/**/*.xml
+alwaysApply: false
+---
+
+# Mule Flow Generation & Modification
+
+The agent hand-writes Mule XML in this project (no MCP). Follow these patterns precisely — schema errors and runtime crashes mostly come from violating one of the rules below.
+
+## Naming
+
+- Flows: `<feature>-<verb>-flow` (e.g. `customers-get-flow`, `orders-create-flow`)
+- Sub-flows: `<feature>-<step>-sub-flow` (e.g. `orders-validate-sub-flow`)
+- Every processor MUST have `doc:name="<descriptive name>"`
+
+## Required XML Root
+
+Every flow file MUST declare `xmlns:doc` — missing it causes the build to fail with `The prefix "doc" for attribute "doc:name" is not bound`.
+
+```xml
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="...">
+  <!-- flows go here -->
+</mule>
+```
+
+## HTTP Listener — Response Configuration
+
+Always configure BOTH success and error responses so error status codes propagate correctly:
+
+```xml
+<http:listener config-ref="HTTP_Listener_config" path="/api/v1/customers" allowedMethods="POST" doc:name="POST /customers">
+  <http:response statusCode="201">
+    <http:headers>#[output application/java --- { "Content-Type": "application/json" }]</http:headers>
+  </http:response>
+  <http:error-response statusCode="#[vars.httpStatus default 500]">
+    <http:body>#[output application/json --- { code: vars.errorCode default "INTERNAL_ERROR", message: vars.errorMessage default error.description }]</http:body>
+    <http:headers>#[output application/java --- { "Content-Type": "application/json" }]</http:headers>
+  </http:error-response>
+</http:listener>
+```
+
+**Gotcha**: `method=` is NOT a valid attribute on `<http:listener>`. Use `allowedMethods="GET"` (comma-separated for multiple, e.g. `"GET,POST"`).
+
+## Error Handling — MANDATORY
+
+Every flow must have an `<error-handler>` with:
+
+- Specific `<on-error-propagate>` blocks for each known error type (e.g. `APP:BAD_REQUEST`, `APP:NOT_FOUND`)
+- A catch-all `<on-error-propagate type="ANY">` at the end
+
+Use `on-error-propagate` (NOT `on-error-continue`) in **outer** flow handlers so `<http:error-response>` fires with the correct status code.
+
+Use `on-error-continue` ONLY inside `<try>` blocks for localized handling that re-raises a new error type.
+
+```xml
+<error-handler>
+  <on-error-propagate type="APP:BAD_REQUEST" doc:name="Bad Request 400">
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+        <ee:set-variable variableName="errorCode">"BAD_REQUEST"</ee:set-variable>
+        <ee:set-variable variableName="errorMessage">error.description</ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </on-error-propagate>
+  <on-error-propagate type="APP:NOT_FOUND" doc:name="Not Found 404">
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="httpStatus">404</ee:set-variable>
+        <ee:set-variable variableName="errorCode">"NOT_FOUND"</ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </on-error-propagate>
+  <on-error-propagate type="ANY" doc:name="Internal Error 500">
+    <ee:transform>
+      <ee:variables>
+        <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+        <ee:set-variable variableName="errorCode">"INTERNAL_ERROR"</ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </on-error-propagate>
+</error-handler>
+```
+
+## User-Friendly Error Responses — MANDATORY
+
+API responses (success AND error) must be CLEAN, ACTIONABLE JSON. The agent MUST NEVER return:
+
+- Raw connector payloads (e.g. `BatchOperationResult`, JDBC `ResultSet`, HTTP request `MultiMap`)
+- Internal Java toString output (`org.mule.runtime.api.metadata.TypedValue@abc123`)
+- Stack traces, hex hashes, or debug dumps
+- Generic fallbacks like `"Unexpected response: { … huge raw json … }"`
+- `error.description` directly when the underlying connector wraps a meaningful business error
+
+### Standard error envelope (every flow, every connector)
+
+```json
+{ "code": "INVALID_FIELD", "message": "BillingCountry: invalid country code 'XYZ' (fields: BillingCountry)" }
+```
+
+That is two fields. `code` is a stable, screaming-snake-case enum the caller can branch on. `message` is human-readable, names the offending field/value when relevant, and is safe to show in a UI.
+
+### Standard success envelope
+
+For creates: `{ "id": "<resource-id>", "status": "created" }`
+For updates: `{ "id": "<resource-id>", "status": "updated" }`
+For deletes: `{ "id": "<resource-id>", "status": "deleted" }`
+For queries: the actual data, NOT a wrapper like `{ "items": [...], "successful": true }` (that's the connector's shape, not the API's).
+
+### Pattern — capture connector errors in the SUB-FLOW, map to HTTP in the OUTER handler
+
+1. **Sub-flow** (where the connector lives): walk the connector response, set `vars.<name>ErrorCode` + `vars.<name>ErrorMessage`, then `<raise-error type="APP:<CONNECTOR>_ERROR" description="...">`.
+2. **Outer flow's `<error-handler>`**: catch `APP:<CONNECTOR>_ERROR`, set `vars.errorCode` / `vars.errorMessage` from the captured vars (NOT from `error.description` directly), and compute `vars.httpStatus` based on the connector's status code.
+3. **`<http:error-response>`**: always uses `vars.httpStatus` / `vars.errorCode` / `vars.errorMessage`.
+
+`vars.*` set before `<raise-error>` survive into the error handler — exploit this so the outer handler stays small and connector-agnostic.
+
+### Connector-specific guidance
+
+- Salesforce: `mule-salesforce.mdc` §7 (read `payload.items[0]`, NEVER `payload[0]`; map SF `statusCode` → HTTP)
+- Database: `mule-database.mdc` (capture `DB:CONNECTIVITY`, `DB:BAD_SQL_SYNTAX`, `DB:QUERY_EXECUTION` separately)
+- HTTP outbound: capture `HTTP:CONNECTIVITY`, `HTTP:CLIENT_ERROR_*`, `HTTP:SERVER_ERROR_*` separately and surface upstream `code` + `message` from the response body when the upstream is JSON
+
+### Wrong vs Right (Salesforce example)
+
+WRONG (what the user sees today if rules are violated):
+```json
+{ "code": "SALESFORCE_REJECTED", "message": "Unexpected SF response (no errors[] populated): {\n  \"id\": null, \"items\": [{ \"payload\": {...}}], \"successful\": true\n}" }
+```
+
+RIGHT:
+```json
+{ "code": "INVALID_FIELD", "message": "BillingCountry: invalid country code 'XYZ' (fields: BillingCountry)" }
+```
+
+If you find yourself writing `"Unexpected … : " ++ write(payload, "application/json")` in a user-facing message, STOP. That's a sign the connector response shape isn't being read correctly — fix the parser instead, and only log the raw payload (at WARN/DEBUG), never return it.
+
+## Validation Pattern (Inside `<try>`)
+
+```xml
+<try>
+  <flow-ref name="customers-validate-sub-flow"/>
+  <error-handler>
+    <on-error-continue type="OS:KEY_NOT_FOUND">
+      <raise-error type="APP:NOT_FOUND" description="Customer not found"/>
+    </on-error-continue>
+  </error-handler>
+</try>
+```
+
+## Configs — Reuse, Don't Duplicate
+
+- HTTP listener config: shared `HTTP_Listener_config` from `global-configs.xml`
+- HTTP request (outbound): named config in `global-configs.xml` with base URI from `config.yaml`
+- Database / Salesforce / Object Store configs: all in `global-configs.xml` — see the dedicated rules
+- Object Store: define `<os:object-store>` in the flow file using `persistent="false"` for dev/test
+
+## DataWeave in Flows
+
+- Inline DWL for simple transforms (< 5 lines)
+- External `.dwl` in `src/main/resources/dwl/` for anything larger; reference via `<ee:set-payload resource="dwl/customer-mapping.dwl"/>`
+- See `mule-dataweave.mdc` for full DWL rules
+
+## Common Gotchas
+
+- **CDATA — only one valid close sequence** — In XML, a CDATA section **must** end with exactly **`]]>`** (two `]` characters, then `>`). Nothing else may appear between your DataWeave text and that terminator except the characters that are **part of the expression**.
+
+- **Deploy failure signature** — If you see `Invalid input ']', expected ~, Function Call or selectors` pointing at an `<ee:set-variable>` or `<http:body>` line, you almost certainly have **an extra `]`** before `]]>` (often looks like `]]]>` at end of file or `"]]]>` after a quoted string).
+
+- **WRONG — extra `]` before CDATA end** (breaks deploy; stray `]` is parsed as DataWeave):
+
+```xml
+<ee:set-variable variableName="errorCode"><![CDATA["INTERNAL_ERROR"]]]></ee:set-variable>
+```
+
+  Here the author typed **`]]]>`** (three `]` before `>`). XML closes CDATA at the **first** valid `]]>`, leaving malformed content / a lone `]` — runtime parses garbage as DW.
+
+- **RIGHT — exactly `]]>` after the expression**:
+
+```xml
+<ee:set-variable variableName="errorCode"><![CDATA["INTERNAL_ERROR"]]></ee:set-variable>
+```
+
+- **Object literal at end of CDATA** — Expression ends with `}`; CDATA ends with **`]]>`** immediately after that brace (no extra `]`):
+
+```xml
+<![CDATA[#[output application/json --- { code: "X" }]]>
+```
+
+  Here **`}]]>`** means: `}` ends the DataWeave object, then **`]]>`** closes CDATA — exactly **two** `]` characters before `>`. **Never** use **`}]]]>`** (that inserts an extra `]` and can reproduce the same deploy error).
+
+- **Prefer skipping CDATA for constant strings in `ee:set-variable`** — avoids `]]>` typos entirely:
+
+```xml
+<ee:set-variable variableName="errorCode" value='#["INTERNAL_ERROR"]' doc:name="errorCode"/>
+```
+
+  Or use a single-line expression attribute `value="#[&quot;INTERNAL_ERROR&quot;]"` / `value='#["INTERNAL_ERROR"]'` per your quoting rules.
+
+- **HTTP listener bodies** — If you wrap `#[output ... --- { ... }]` in CDATA, the sequence after the closing `}` is **`]]>`** only, e.g. `... }]]>` inside `<![CDATA[ ... ]]>` (see `}]]>` above — still only two `]` before `>`).
+- `var input = payload` is INVALID in DW header — never assign `payload` to a variable
+- `error()` is NOT a standard DW function — use `<choice>` + `<raise-error>` for validation
+- Object Store `<os:store>` saves whatever you give it. If you used `output application/json` before storing, you stored a **JSON string**. Use `output application/java` BEFORE store, then a separate `output application/json` AFTER for the HTTP response.
+- Object Store `retrieve-all` returns a Java Map of keys → values; use `valuesOf(payload)` to get an array
+- Object Store `retrieve` returns the object directly — no `read()` needed
+- `flow-ref` target name must match the `<flow name="...">` exactly (case-sensitive)
+
+## Self-Test Gate — MANDATORY before declaring flow / DW work done
+
+The agent MUST NOT report a flow change as "done" or recommend the user run / smoke-test until ALL of the steps below pass. Skipping a step and shipping the change to the user is a workflow regression — the user pays for the deploy-fail loop in 90-second increments.
+
+### Required gates, in order
+
+1. **Lint** — run `ReadLints` on every edited XML / DW file. Treat any `[ERROR]` as a deploy-blocker. Fix before continuing. (Warnings are OK to leave if they are pre-existing or known type-inference noise.)
+
+2. **Mule reachable check** — confirm the runtime is up by checking `Get-NetTCPConnection -LocalPort 8081 -ErrorAction SilentlyContinue` returns a connection (or just attempting `Invoke-WebRequest http://localhost:8081/api/v1/products -TimeoutSec 5 -SkipHttpErrorCheck`). If not running, ask the user to start it via task `Mule: Run (Cursor)` BEFORE proceeding to step 3 — don't assume it's up.
+
+3. **Smoke test** — run `scripts/smoke-test.ps1` (or task `Mule: Smoke test`). The script:
+   - Hits every endpoint in `API.md`.
+   - Asserts on HTTP status, response shape, AND known sample values from the bundled fixtures.
+   - Exits 0 on full pass, 1 on any failure with a per-case PASS/FAIL summary.
+
+   The agent MUST report the script's exit code and the summary line in the response. If exit code is non-zero, fix the issue and re-run — don't hand a failing change back to the user.
+
+4. **Update fixtures if surface changed** — if the change added/removed an endpoint, changed a field name, changed a status code, or changed an error code, the agent MUST update `scripts/smoke-test.ps1` in the SAME response so the new gate is meaningful. A green smoke test on stale assertions is worse than a red one.
+
+### What the smoke test catches that the linter cannot
+
+- `readUrl` MIME-type bugs (parsed fine, fails at runtime — see `mule-dataweave.mdc`)
+- Wrong status codes (200 returned where 404 expected, etc.)
+- Wrong error envelope shape (`code` field missing, `message` empty)
+- Wrong field names in the response (e.g. `Price` vs `price`)
+- Wrong field types (e.g. a numeric field returned as a quoted string `"193.52"` instead of a JSON number)
+- Stale `vars` references that compile but resolve to null at runtime
+- Connector mocks that succeed in MUnit but fail against the real connector
+
+The lint gate catches **parse-time** bugs. The smoke gate catches **runtime** bugs. Both classes are in scope; both gates are required.
+
+### When the gate is allowed to be skipped
+
+Only when:
+- The change is purely documentation (`API.md`, `PROJECT_CONTEXT.md`, `*.mdc` rule files, README).
+- The change is purely to a `.dwl` test-fixture file under `src/test/resources/` that no flow loads.
+- The change is to `pom.xml` or `mule-artifact.json` AND no XML/DW was touched (in which case run `mvn validate` instead).
+
+In every other case, the gate runs.
+
+## After Editing
+
+- Run `MuleSoft: Validate Project` in ACB to catch schema issues early
+- Reload Window if completion / hover info goes stale

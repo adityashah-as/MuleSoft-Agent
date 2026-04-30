@@ -1,0 +1,129 @@
+---
+description: MuleSoft project standards, Anypoint Code Builder workflow, and local testing
+alwaysApply: true
+---
+
+# MuleSoft Project Standards
+
+This is a MuleSoft 4 project developed in **Anypoint Code Builder (ACB)** — the official VS Code extension. We do **NOT** use the MuleSoft MCP server. The agent must hand-write Mule XML, DataWeave, and MUnit XML following the patterns in the focused rules below.
+
+Deployment (CloudHub, RTF, on-prem) is handled **manually by the developer** — do not generate or run deploy commands.
+
+## Source of Truth — Two Living Files
+
+| File | Purpose |
+|---|---|
+| `PROJECT_CONTEXT.md` | Project state — runtime, inventories, env vars, decisions log |
+| `API.md` | Human-readable API reference — every endpoint with demo request/response |
+
+**Before any code work**: read `PROJECT_CONTEXT.md` first. If it doesn't exist, or the answer to a question isn't in it, follow `mule-init-context.mdc` (init workflow + Never-Guess Policy). When endpoints change, update `API.md` in the SAME response per `mule-api-docs.mdc`.
+
+## Rule Index
+
+| Concern | Rule |
+|---|---|
+| **Project context + init workflow (read first)** | **`mule-init-context.mdc`** |
+| **API.md (human-readable API reference)** | **`mule-api-docs.mdc`** |
+| New project scaffolding | `mule-project-scaffold.mdc` |
+| RAML / OAS API specs | `mule-api-spec.mdc` |
+| Flow & sub-flow XML | `mule-flow-generation.mdc` |
+| DataWeave 2.0 transforms | `mule-dataweave.mdc` |
+| MUnit tests | `mule-testing-munit.mdc` |
+| Database connector (any JDBC DB) | `mule-database.mdc` |
+| Salesforce connector | `mule-salesforce.mdc` |
+
+## Project-Wide Standards
+
+1. **Mule runtime**: 4.6.x or newer (LTS preferred). Set in `mule-artifact.json` → `minMuleVersion`.
+2. **Java**: JDK 17 (preferred) or JDK 11. Set in `mule-artifact.json` → `javaSpecificationVersions: ["17"]`.
+3. **Naming conventions**:
+   - Flows: `<feature>-<verb>-flow` (e.g. `customers-create-flow`)
+   - Sub-flows: `<feature>-<step>-sub-flow` (e.g. `customers-validate-sub-flow`)
+   - Configs: `<system>_<type>_config` (e.g. `Salesforce_Sandbox_config`, `MySQL_DB_config`)
+   - Files: kebab-case (e.g. `customer-api.xml`, `customer-mapping.dwl`)
+4. **Every processor** carries `doc:name="..."` for readability.
+5. **`xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"`** MUST be on the `<mule>` root of every XML file that uses `doc:name`.
+6. **No secrets in source** — use JVM system properties injected at launch (`-M-Dname=value` / launch `args`, matching placeholders like `${sfdc.password}` in XML), `secure-properties`, or Runtime Manager **secured** properties. Do **not** put OS env var names in XML as `${env.VAR}` — Mule does not resolve those to the OS (see `mule-init-context.mdc`). Never commit passwords/tokens.
+7. **Reuse global configs** from `src/main/mule/global-configs.xml`. Never duplicate connector configs across flow files.
+
+## Anypoint Code Builder Workflow
+
+Use these ACB commands via the Command Palette (`Ctrl+Shift+P`):
+
+| Task | ACB Command |
+|---|---|
+| Scaffold project | `MuleSoft: Create New Mule Project` |
+| Open project | `MuleSoft: Open Project` (also "Add Folder to Workspace") |
+| Validate XML / build | `MuleSoft: Validate Project` |
+| Add a connector | `MuleSoft: Add Dependency` (searches Exchange) |
+| Run locally | `MuleSoft: Run Project` (or **F5** for Debug) |
+| Refresh after edits | `Developer: Reload Window` if completion / extensions get stale |
+| Run MUnit tests | Right-click test XML → `Run MUnit Tests` |
+
+## Local Testing Workflow
+
+Local run + endpoint testing replaces deployment for this project.
+
+### Pick the right path for the IDE
+
+| IDE | Recommended way to run | Why |
+|---|---|---|
+| **Cursor** | `.vscode/tasks.json` task **`Mule: Run (Cursor)`** which calls `scripts/run-mule.ps1` | The ACB Mule debug adapter (`type: mule`) and `mule-xml-debugger` are **not supported in Cursor** — F5 fails with "Configured debug type 'mule' is not supported" or JS errors like "split is not defined" |
+| **VS Code + Anypoint Code Builder** | F5 → debug config in `launch.json` (`type: mule`) | Works because ACB extension installs the debug adapter |
+
+When the project is opened in Cursor (or any non-VS-Code editor), the agent MUST direct the user to the task — never tell them to "press F5" or "use ACB Run" without first checking which IDE they're in.
+
+### Cursor task workflow (no ACB debug adapter required)
+
+> **JDK gotcha**: Mule Runtime 4.8.x supports **up to JDK 17 only**. If the system default is JDK 21+, the Maven build fails with `Version 4.8.10 doesn't support JVM version 21.0.9`. The runner script must pin `JAVA_HOME` to ACB's bundled `~/AnypointCodeBuilder/java/jdk-17.*` for both Maven and the runtime. Newly-created scripts/configs MUST do this.
+
+1. **Pre-flight**:
+   - `.env` exists with real values for every secret variable in `.env.example`
+   - Port 8081 free: `Get-NetTCPConnection -LocalPort 8081 -ErrorAction SilentlyContinue`
+2. **Start**: `Ctrl+Shift+P` → `Tasks: Run Task` → **`Mule: Run (Cursor)`** (or `Ctrl+Shift+B` since it's the default build task). The script:
+   - Loads `.env` into the process
+   - Builds the app with `mvn clean package -DskipTests`
+   - Copies the packaged jar to the standalone runtime `apps/` folder
+   - Sets `MULE_OPTS="-Dsfdc.username=… -Dsfdc.password=… -Dsfdc.token=…"`
+   - Runs `mule.bat console` so logs stream in the task panel
+3. **Stop**: run task **`Mule: Stop`** (or `Ctrl+C` in the task panel)
+4. **Tail log separately**: run task **`Mule: Tail log`** (auto-discovers the latest runtime under `~/AnypointCodeBuilder/runtime`)
+5. Wait for `DEPLOYED` (~60–90s) before hitting endpoints
+
+### VS Code + ACB workflow (alternative)
+
+1. Validate (`MuleSoft: Validate Project`)
+2. F5 → pick a `type: mule` config from `launch.json`. Wait for `DEPLOYED`.
+
+### Hitting endpoints from PowerShell (both workflows)
+   ```powershell
+   # GET
+   Invoke-RestMethod -Uri "http://localhost:8081/api/v1/customers" -Method GET
+
+   # POST with JSON body
+   $body = @{ name = "Acme"; email = "a@b.com" } | ConvertTo-Json
+   Invoke-RestMethod -Uri "http://localhost:8081/api/v1/customers" `
+     -Method POST -Body $body -ContentType "application/json"
+   ```
+5. **Test BOTH happy paths AND error cases** (400 invalid body, 404 missing record) before declaring done.
+6. **Stop / restart**: `Get-Process java | Stop-Process -Force` then re-run.
+
+## Standard Project Layout
+
+```
+<project>/
+  pom.xml
+  mule-artifact.json
+  src/
+    main/
+      mule/
+        global-configs.xml      <- HTTP listener + all connector configs
+        <feature>-api.xml       <- one file per API/feature
+      resources/
+        config.yaml             <- non-secret properties
+        api/                    <- RAML / OAS specs
+        dwl/                    <- external DataWeave modules
+    test/
+      munit/                    <- MUnit test suites
+      resources/                <- test fixtures
+```

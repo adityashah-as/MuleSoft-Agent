@@ -1,0 +1,121 @@
+---
+description: MUnit test standards for Mule 4 flows (hand-written XML)
+globs: **/src/test/munit/**/*.xml
+alwaysApply: false
+---
+
+# MUnit Testing Rules
+
+## File & Naming
+
+- **Location**: `src/test/munit/`
+- **File name**: `<flow-file-name>-test-suite.xml`
+  - e.g. flow file `customer-api.xml` → test file `customer-api-test-suite.xml`
+- **Test case name**: `<flow-name>-<scenario>` (e.g. `customers-create-flow-success`, `customers-create-flow-missing-fields`)
+
+## Minimum Coverage Per Flow
+
+Every flow must have at least:
+
+1. **Happy path** — valid input → expected output
+2. **Error path** — invalid input → proper error response (status code + body)
+3. **Edge case** when applicable — empty list, missing optional fields, boundary values
+
+## Required Test Structure
+
+```xml
+<munit:test name="customers-create-flow-success" description="POST /customers happy path">
+  <munit:behavior>
+    <!-- mocks + event setup -->
+  </munit:behavior>
+  <munit:execution>
+    <flow-ref name="customers-create-flow"/>
+  </munit:execution>
+  <munit:validation>
+    <!-- assertions -->
+  </munit:validation>
+</munit:test>
+```
+
+## Mocking Rules
+
+- Mock ALL external connectors: HTTP Request, **Salesforce**, **Database**, Object Store, File, FTP
+- Use `<munit-tools:mock-when processor="...">` and target by processor name and `doc:name`
+- For error mocks, put the error INSIDE `<munit-tools:then-return>`:
+  ```xml
+  <munit-tools:mock-when processor="os:retrieve" doc:name="mock missing key">
+    <munit-tools:with-attributes>
+      <munit-tools:with-attribute attributeName="key" whereValue="#['missing-id']"/>
+    </munit-tools:with-attributes>
+    <munit-tools:then-return>
+      <munit-tools:error typeId="OS:KEY_NOT_FOUND"/>
+    </munit-tools:then-return>
+  </munit-tools:mock-when>
+  ```
+- **NEVER use `munit-tools:then-throw`** — it does not exist. Use `<munit-tools:error>` inside `<then-return>` as above.
+
+## Mocking Salesforce
+
+```xml
+<munit-tools:mock-when processor="salesforce:create" doc:name="mock SF create Account">
+  <munit-tools:then-return>
+    <munit-tools:payload value="#[[{ id: '001xx000003DGb2', success: true, errors: [] }]]" mediaType="application/java"/>
+  </munit-tools:then-return>
+</munit-tools:mock-when>
+```
+
+## Mocking Database
+
+```xml
+<munit-tools:mock-when processor="db:insert" doc:name="mock DB insert">
+  <munit-tools:then-return>
+    <munit-tools:payload value="#[{ affectedRows: 1, generatedKeys: { GENERATED_KEY: 42 } }]" mediaType="application/java"/>
+  </munit-tools:then-return>
+</munit-tools:mock-when>
+```
+
+## Assertion Rules
+
+- Assert response payload structure AND values
+- Assert error type via `expectedErrorType` attribute on `<munit:test>` for error tests
+- Use `MunitTools::equalTo()`, `MunitTools::startsWith()`, `MunitTools::notNullValue()`, `MunitTools::containsString()`
+- Assert list size with `sizeOf(payload)`
+
+```xml
+<munit-tools:assert-that expression="#[payload.id]" is="#[MunitTools::notNullValue()]"/>
+<munit-tools:assert-that expression="#[sizeOf(payload)]" is="#[MunitTools::equalTo(3)]"/>
+```
+
+## Running Tests
+
+In Anypoint Code Builder:
+
+- Right-click the test XML → `Run MUnit Tests`
+- OR: Command Palette → `MuleSoft: Run MUnit Tests`
+- OR: from a terminal — `mvn clean test`
+
+## After Editing Tests
+
+- Run `MuleSoft: Validate Project` to catch XML schema issues
+- Run the suite locally before declaring done
+
+## Test Gates — Who Runs What
+
+There are TWO complementary test layers. Both matter; they catch different things.
+
+| Layer | Who runs it | When | What it catches |
+|---|---|---|---|
+| **MUnit suite** (`src/test/munit/`) | **User**, in ACB ("Run MUnit Tests") OR via `mvn test` (requires Anypoint Exchange Maven creds in `settings.xml`) | After ANY flow / DW / mock / connector change. Before commit. | In-process bugs: DW logic, sub-flow assembly, error-handler routing, connector behavior (mocked), payload shapes |
+| **Smoke test** (`scripts/smoke-test.ps1`) | **Agent**, automatically per the gate in `mule-flow-generation.mdc`. User can also run via task `Mule: Smoke test`. | After ANY flow / DW change, before reporting work as done. | End-to-end bugs through the HTTP listener: wrong status codes, wrong response envelope, runtime DW errors (e.g. `readUrl` MIME-type bugs) |
+
+### When to add a new MUnit test
+
+Whenever a new flow, sub-flow, or error path is introduced — same as the "Minimum Coverage Per Flow" section above. The agent SHOULD add the MUnit cases in the SAME response as the implementation. The user runs them in ACB.
+
+### When to add to the smoke test
+
+Whenever an endpoint, response field, error code, or status mapping changes in `API.md`. The smoke test is the live contract — keep it in lockstep with `API.md` and the flow XML.
+
+### The two-layer rationale
+
+MUnit catches things that survive the smoke test (e.g. a sub-flow that's reachable but never invoked by any flow, or a connector mock the production code drifted away from). The smoke test catches things that pass MUnit but blow up at runtime (DW evaluating against the real CSV, real HTTP envelope, real listener config). Neither layer alone is sufficient. Drop either one and the project regresses.

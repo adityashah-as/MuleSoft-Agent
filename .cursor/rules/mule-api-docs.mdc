@@ -1,0 +1,156 @@
+---
+description: API.md — human-readable API documentation; create and keep in sync with every endpoint change
+alwaysApply: true
+---
+
+# API Documentation File (`API.md`)
+
+Every Mule project MUST maintain an `API.md` at the project root. It is the **human-readable companion** to the RAML/OAS spec — the page a new developer, QA, or integration partner opens FIRST to understand "what does this API do, and how do I call it?"
+
+The RAML/OAS file is for machines. `API.md` is for humans.
+
+---
+
+## When to Create / Update
+
+The agent MUST:
+
+1. **Create `API.md`** the first time an endpoint is added to a project that doesn't have it yet.
+2. **Update `API.md`** in the SAME response as any of these changes:
+   - New endpoint added
+   - Existing endpoint's path / method / request body / response body / error responses change
+   - Endpoint deleted
+   - Authentication / required headers change
+3. Keep it consistent with: the RAML/OAS spec, the flow XML, and the API Inventory table in `PROJECT_CONTEXT.md`. If you change one, you change all four.
+
+---
+
+## File Location & Naming
+
+- Path: `<project-root>/API.md`
+- Don't bury it under `docs/` unless the project explicitly uses a `docs/` convention (record that in `PROJECT_CONTEXT.md` § Decisions Log).
+
+---
+
+## Required Structure
+
+```markdown
+# <Project Name> — API Reference
+
+> Last updated: <YYYY-MM-DD>
+> Base URL (local): `http://localhost:8081/api/v1`
+> Base URL (sandbox): `<TBD or actual>`
+> Auth: <none / API key / OAuth ...>
+
+## Endpoint Index
+
+| # | Method | Path | Summary | Auth | Status |
+|---|---|---|---|---|---|
+| 1 | POST | /create-account | Create a Salesforce Account | none | live |
+
+---
+
+## 1. POST /create-account — Create a Salesforce Account
+
+**What it does** (1–3 sentence narrative explaining the business purpose, downstream side effects, and any gotchas):
+
+> Creates a new Salesforce Account from the supplied JSON body. The request fields use Salesforce PascalCase field names (e.g. `Name`, `BillingCity`) and are passed straight through to the Salesforce SOAP API after stripping nulls. Returns the new Salesforce Id on success.
+
+### Request
+
+- **Method**: `POST`
+- **Path**: `/api/v1/create-account`
+- **Auth**: none (local dev)
+- **Headers**:
+  | Header | Required | Example |
+  |---|---|---|
+  | `Content-Type` | yes | `application/json` |
+
+- **Body** (`application/json`):
+  | Field | Type | Required | Description | Example |
+  |---|---|---|---|---|
+  | `Name` | string | **yes** | Account name | `"Nebula Cloud Systems"` |
+  | `Industry` | string | no | Industry vertical | `"Technology"` |
+  | `BillingCity` | string | no | City | `"San Francisco"` |
+  | ... | | | | |
+
+### Demo Request (PowerShell)
+
+```powershell
+$body = @{
+  Name = "Nebula Cloud Systems"
+  Industry = "Technology"
+  BillingCity = "San Francisco"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "http://localhost:8081/api/v1/create-account" `
+  -Method POST `
+  -Body $body `
+  -ContentType "application/json"
+```
+
+### Demo Request (curl)
+
+```bash
+curl -X POST http://localhost:8081/api/v1/create-account \
+  -H "Content-Type: application/json" \
+  -d '{ "Name": "Nebula Cloud Systems", "Industry": "Technology", "BillingCity": "San Francisco" }'
+```
+
+### Success Response — `201 Created`
+
+```json
+{
+  "id": "001XXXXXXXXXXXXAAA",
+  "status": "created"
+}
+```
+
+### Error Responses
+
+| Status | Code | When | Example body |
+|---|---|---|---|
+| 400 | `BAD_REQUEST` | Required field missing or invalid | `{ "code": "BAD_REQUEST", "message": "Name is required" }` |
+| 422 | `SALESFORCE_REJECTED` | Salesforce rejected the create (validation rule, dup, etc.) | `{ "code": "SALESFORCE_REJECTED", "message": "DUPLICATE_VALUE: ..." }` |
+| 503 | `SALESFORCE_UNAVAILABLE` | Cannot reach Salesforce | `{ "code": "SALESFORCE_UNAVAILABLE", "message": "..." }` |
+| 500 | `INTERNAL_ERROR` | Anything else | `{ "code": "INTERNAL_ERROR", "message": "..." }` |
+
+---
+
+## Conventions
+
+- All success responses are `application/json`
+- All error responses follow the standard error shape: `{ code: string, message: string }`
+- Timestamps (when used): ISO-8601 UTC, e.g. `2026-04-29T12:00:00Z`
+```
+
+---
+
+## Quality Bar — Each Endpoint Section MUST Include
+
+- One-line summary in the index table
+- "What it does" narrative — explains purpose, side effects, anything subtle a caller should know (NOT just a re-statement of the path)
+- Method, path, auth, required headers
+- Full body schema as a table (not just a reference to the RAML — duplicate it here for readability)
+- **At least one realistic demo request** in BOTH PowerShell (`Invoke-RestMethod`) AND curl
+- Success response example with realistic values
+- Every error response with: status, code, when it fires, example body
+
+If any of these are missing, the agent MUST fill them in before declaring the work done — never a `TBD` in `API.md`.
+
+---
+
+## Cross-File Consistency Rules
+
+Whenever an endpoint changes, the agent MUST update ALL of these in the same response:
+
+| File | What to update |
+|---|---|
+| `src/main/resources/api/<api>.raml` | Spec (types, examples, responses) |
+| `src/main/mule/<feature>-api.xml` | Flow & error handling |
+| `src/test/munit/<feature>-api-test-suite.xml` | New/updated test case |
+| `API.md` | Endpoint section + index row |
+| `PROJECT_CONTEXT.md` § 4 (API Inventory) | Status flags |
+
+Treat `API.md` as a first-class deliverable. If it drifts from the actual flow, the project is broken.

@@ -1,0 +1,384 @@
+---
+description: Project context file (PROJECT_CONTEXT.md) and initialization workflow — never guess, always ask
+alwaysApply: true
+---
+
+# Project Context & Initialization
+
+This project is the source of truth for every MuleSoft engagement. It defines:
+
+1. The **single project context file** (`PROJECT_CONTEXT.md`) that holds the WHAT (state) — separate from the rules which hold the HOW (standards).
+2. The **initialization workflow** — what the agent does before any code work.
+3. The **Never-Guess Policy** — strict rule for handling missing information.
+
+---
+
+## The Golden Rule — Never Guess, Always Ask
+
+If a value, name, host, port, credential location, environment URL, SObject name, table name, or any other project-specific detail is **NOT in `PROJECT_CONTEXT.md`** and **NOT directly given by the user in this session**, the agent MUST:
+
+1. STOP. Do not generate code, XML, configs, or commands using a guessed value.
+2. Use the `AskQuestion` tool (or plain text) to ask the user for the missing detail(s) — batch related questions together.
+3. Once answered, **immediately update `PROJECT_CONTEXT.md`** with the new info (without secrets).
+4. Then resume the original task.
+
+Never substitute placeholders like `your-host`, `TODO`, `example.com`, `XXXX` and call the work done. Either the real value is known and used, or the agent stopped to ask.
+
+---
+
+## When Initialization Triggers
+
+Run the **Init Workflow** below when ANY of these is true:
+
+- `PROJECT_CONTEXT.md` does not exist at the project root
+- A new connector is requested but is not in the Connector Inventory
+- A new environment is referenced (e.g. "deploy to QA") that isn't in the Environments section
+- A new endpoint is requested and the API Inventory section is empty
+- The user asks something that requires info the file doesn't yet capture
+- A connector that needs credentials is being added but `.env` / `.env.example` / `.vscode/launch.json` don't yet exist (run the **Local-Dev Secrets Bootstrap** below)
+- The project has at least one HTTP endpoint but `scripts/smoke-test.ps1` and/or the `Mule: Smoke test` task in `.vscode/tasks.json` is missing (run the **Smoke-Test Wiring Bootstrap** below)
+
+After initialization OR a context update, **always update `PROJECT_CONTEXT.md` in the same response** before/with the code change.
+
+## Smoke-Test Wiring Bootstrap — MANDATORY when missing on an existing project
+
+When the trigger above fires (HTTP endpoint exists but smoke wiring is missing), the agent MUST scaffold the three artifacts described in `mule-project-scaffold.mdc` § Self-Test Wiring before proceeding to any new flow / DW work:
+
+1. Create `scripts/smoke-test.ps1` from the template in the scaffold rule, populated with one numbered case per endpoint listed in `API.md`. Pull fixture values from the project's bundled test data (CSV / JSON / RAML examples) — never use placeholder strings.
+2. Add the `Mule: Smoke test` task entry to `.vscode/tasks.json` (verbatim from the scaffold rule — no project-specific changes).
+3. Verify the Self-Test Gate rule (`mule-flow-generation.mdc` § Self-Test Gate) is present in the project's `.cursor/rules/` folder. If missing, copy it in.
+4. Log the bootstrap in `PROJECT_CONTEXT.md` § 10 Decisions Log with the date and a one-line rationale.
+5. If `API.md` doesn't yet exist, run the API-docs init (per `mule-api-docs.mdc`) FIRST so the smoke test has a source of truth to derive cases from.
+
+Skipping this bootstrap and proceeding straight to flow work is a workflow regression — the agent loses its self-test gate and the developer loses their post-deploy sanity check.
+
+---
+
+## Init Workflow — Questions to Ask
+
+Ask in batches using `AskQuestion`. Skip questions whose answers are already known. Group by section:
+
+### A. Project basics
+- Project name, short purpose (1 sentence), business/system owner
+- Source repo URL (if applicable)
+
+### B. Runtime
+- Mule version (default `4.6.x` LTS)
+- Java version (default `17`)
+- HTTP host (default `0.0.0.0` local), port (default `8081`), basePath (e.g. `/api/v1`)
+- HTTP vs HTTPS / TLS requirements
+
+### C. API style
+- REST or SOAP (default REST)
+- Spec format: RAML 1.0 or OAS 3.0 (default RAML)
+- Versioning: URI segment (`/v1`) or header
+- Auth on the API (none, API key, OAuth, mTLS)
+
+### D. Target systems (per integration — ask one set per system)
+For EACH external system the project will talk to:
+- System type (Salesforce, MySQL, PostgreSQL, Oracle, SQL Server, REST API, SOAP service, SFTP, JMS, Kafka, etc.)
+- Logical name + intended Mule config name (e.g. `Salesforce_Sandbox_config`)
+- Endpoint / host / instance URL (non-secret)
+- Auth type (basic / OAuth client_credentials / OAuth JWT / API key / certificate / etc.)
+- Secret variable names (e.g. `SFDC_USERNAME`, `SFDC_PASSWORD`, `SFDC_TOKEN`) — names only, not values
+- Where those secrets live (env vars / `secure-properties.yaml` / Anypoint Vault — see secrets policy below)
+- For DBs: schema/database name, JDBC driver
+- For Salesforce: sandbox vs production, API version, org type
+- For HTTP: required headers, timeouts
+
+### E. Environments
+- Which envs exist (local, dev, sandbox, qa, prod)
+- Which property file maps to each (`config-local.yaml`, `config-prod.yaml`, etc.)
+- How env is selected at runtime (e.g. `-Denv=local` system property)
+
+### F. Logging, error handling, testing
+- Log level per env (default INFO local, WARN prod)
+- Standard error response shape (default `{ code, message }`)
+- MUnit coverage target (default ≥ 70% line coverage)
+
+### G. Anything else that affects future code
+- Custom naming overrides
+- Compliance / data residency / PII constraints
+- Existing reusable assets in Anypoint Exchange to reuse
+
+---
+
+## Secrets Policy (THREE supported mechanisms)
+
+Document in `PROJECT_CONTEXT.md` which mechanism the project uses per environment. Never put real secret values anywhere except the secret store itself.
+
+| Mechanism | When to use | How referenced in Mule |
+|---|---|---|
+| **Env vars → injected as JVM system properties at launch** | Local dev (the `.env` + `scripts/run-mule.ps1` pattern), CI smoke tests | `${sfdc.password}` (NEVER `${env.X}` — see "CRITICAL Mule Property Resolution Gotcha" below) |
+| **`secure-properties.yaml`** (encrypted with `secure-properties-tools`) | Shared/committed configs, on-prem, Runtime Fabric, prod-with-keys-in-Vault | `${secure::sfdc.password}` after configuring `<secure-properties:config>` |
+| **Anypoint Vault / Runtime Manager Properties tab** | CloudHub 1.0 / 2.0 deployments | `${sfdc.password}` — the property is set per-app in Runtime Manager (mark sensitive ones as **secured** so they're masked) |
+
+The agent MUST ask "where will secrets live for this project?" during init and record the choice **per environment** in `PROJECT_CONTEXT.md` (it can differ between local, CI, and prod).
+
+---
+
+## CRITICAL Mule Standalone Runtime Gotcha — MULE_OPTS is overwritten
+
+When running the standalone runtime via `mule.bat console` (Cursor task path), **do NOT** try to inject system properties through `$env:MULE_OPTS`. Line ~113 of `mule.bat` unconditionally **overwrites** the caller's MULE_OPTS with internal wrapper-configuration values:
+
+```bat
+set MULE_OPTS=set.MULE_APP=%MULE_APP% ... wrapper.app.parameter.1=%1 ...
+```
+
+Anything you set before invoking `mule.bat` is lost.
+
+**Correct pattern** — pass system properties as **positional command-line args** using the `-M-D<prop>=<value>` syntax AFTER the command label:
+
+```powershell
+& mule.bat console `
+  "-M-Dsfdc.username=$env:SFDC_USERNAME" `
+  "-M-Dsfdc.password=$env:SFDC_PASSWORD" `
+  "-M-Dsfdc.token=$env:SFDC_SECURITY_TOKEN"
+```
+
+`launcher.bat` runs `mule-wrapper-additional-parameters-parser.jar` which converts `-M-D<key>=<value>` args into JVM `-D` system properties for the spawned Mule JVM. `${sfdc.username}` in `global-configs.xml` then resolves correctly.
+
+This is exactly what `scripts/run-mule.ps1` does. New scripts MUST follow the same pattern; new connector secrets MUST be added in three places: `.env`, `.env.example`, AND the `-M-D` arg list in `scripts/run-mule.ps1`.
+
+---
+
+## CRITICAL Mule Property Resolution Gotcha — `${env.X}` does NOT read OS env vars
+
+Mule 4's `<configuration-properties>` resolver does **NOT** auto-translate `${env.SFDC_USERNAME}` into "read OS env var `SFDC_USERNAME`". It treats `env.SFDC_USERNAME` as a literal property name to look up. If no such property is loaded, deploy fails with:
+
+```
+PropertyNotFoundException: Couldn't find configuration property value for key ${env.SFDC_USERNAME:}
+```
+
+The trailing `:` in that error is Mule's default-value separator — confirms it's a placeholder-resolution failure, not a connection issue.
+
+**Mule 4 only resolves `${name}` placeholders against:**
+1. Properties already loaded by `<configuration-properties>` from a YAML/properties file
+2. **JVM system properties** (`-Dname=value` passed at startup)
+3. Secure properties (when `secure-properties-tools` is configured)
+
+OS environment variables are NEVER read directly. The standard pattern is to **inject env-var values as JVM system properties at startup** via the launch config.
+
+## Local-Dev Secrets Bootstrap (`.env` Pattern) — MANDATORY
+
+The first time a Mule connector that needs credentials is added (Salesforce, Database, HTTP outbound with auth, FTP, JMS, etc.), the agent MUST automatically create the full local-dev secrets bootstrap. Do not wait to be asked.
+
+The bootstrap is FOUR coordinated changes — do all of them, in this order:
+
+### 1. `.env` (gitignored) — holds the real values
+At project root, one var per line:
+```
+SFDC_USERNAME=replace-with-real-value
+SFDC_PASSWORD=replace-with-real-value
+SFDC_SECURITY_TOKEN=replace-with-real-value
+```
+
+### 2. `.env.example` (committed) — template with empty values
+Same variable names, comments documenting where to obtain each secret.
+
+### 3. `.vscode/launch.json` — passes env vars as JVM system properties
+
+The launch `args` MUST use `-M-D<mule.prop.name>=${env:<ENV_VAR_NAME>}` — the `-M-D` prefix tells the Mule wrapper to forward as a JVM system property. The `${env:...}` substitution pulls from the spawning process environment (loaded by `envFile` if the adapter supports it; otherwise from OS env vars set via `setx`).
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "mule",
+      "request": "launch",
+      "name": "Run Mule App (with .env)",
+      "internalConsoleOptions": "openOnSessionStart",
+      "mule.project": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "args": [
+        "-M-Dsfdc.username=${env:SFDC_USERNAME}",
+        "-M-Dsfdc.password=${env:SFDC_PASSWORD}",
+        "-M-Dsfdc.token=${env:SFDC_SECURITY_TOKEN}"
+      ]
+    },
+    {
+      "type": "mule",
+      "request": "launch",
+      "name": "Run Mule App (use OS env vars)",
+      "internalConsoleOptions": "openOnSessionStart",
+      "mule.project": "${workspaceFolder}",
+      "args": [
+        "-M-Dsfdc.username=${env:SFDC_USERNAME}",
+        "-M-Dsfdc.password=${env:SFDC_PASSWORD}",
+        "-M-Dsfdc.token=${env:SFDC_SECURITY_TOKEN}"
+      ]
+    }
+  ]
+}
+```
+
+### 4. `.gitignore` — append `.env`, `.env.local`, `.env.*.local`
+**Never** ignore `.env.example` or `.vscode/launch.json` — both must be committed.
+
+### Coordinated XML and YAML changes
+
+When the bootstrap is created OR a new credential-using connector is added:
+
+- **`global-configs.xml`** uses **plain placeholders that match the `-M-D` keys** — e.g. `${sfdc.username}`, NOT `${env.SFDC_USERNAME}`.
+- **`config.yaml`** holds ONLY non-secret defaults (URLs, hosts, ports, basePath, instance names). NEVER add credential entries to `config.yaml`, even chained through `${env.X}` — Mule won't resolve them and deploy will fail at startup.
+- **Launch args mapping**: every secret variable in `.env` must have a matching `-M-D<placeholder>=${env:<VAR>}` line in BOTH launch configs.
+
+### When ADDING new connectors later
+
+Append in lockstep:
+- new variable names to `.env` AND `.env.example`
+- matching `-M-D…=${env:…}` lines to BOTH launch configs
+- matching `${…}` placeholders in `global-configs.xml`
+
+After creating/updating these files, log a row in `PROJECT_CONTEXT.md` § 10 (Decisions Log) and update § 7 (Secrets Management).
+
+---
+
+## Deployment Secrets Handoff — `.env` is LOCAL-ONLY
+
+`.env` is a developer-laptop convenience. It is **never** part of any deployment artifact and **must not** be relied on in any non-local environment. Verify this by checking three things hold true:
+
+1. `.env` lives at the project root (NOT under `src/main/resources/`). `mvn package` only includes files under `src/main/{mule,resources,java}/`, so `.env` cannot end up in the deploy JAR.
+2. `.env` is in `.gitignore` (alongside `.env.local`, `.env.*.local`).
+3. No Mule connector/component reads `.env` directly — only `scripts/run-mule.ps1` does, and only on the developer's machine.
+
+When the agent is asked anything like "will this work when I deploy it?" / "do I need to do something extra in CloudHub/RTF/on-prem?", the answer is **YES — secrets MUST be set on the deployment target**, because `${sfdc.password}` and friends have no source there. The agent MUST present the appropriate row(s) from this table:
+
+| Target | Where to set `${sfdc.username}` / `${sfdc.password}` / `${sfdc.token}` etc. |
+|---|---|
+| **Developer laptop (local standalone via Cursor)** | `.env` → `scripts/run-mule.ps1` → `-M-D` args. Already wired. |
+| **Another developer's laptop** | They copy `.env.example` → `.env`, fill values, run task `Mule: Run (Cursor)`. |
+| **On-prem standalone Mule runtime** | EITHER: edit `<MULE_HOME>/conf/wrapper.conf` and add `wrapper.java.additional.<n>=-Dsfdc.username=...` per property (restart). OR: launch with `mule.bat console -M-Dsfdc.username=... -M-Dsfdc.password=... -M-Dsfdc.token=...`. |
+| **CloudHub 1.0** | Anypoint Platform → Runtime Manager → app → **Properties** tab → add one row per `${name}`. Mark password/token rows as **secured** (eye icon). Apply changes (worker restarts). |
+| **CloudHub 2.0** | Runtime Manager → app → **Deployment / Properties** → same as CH1, with the same secured-property option. |
+| **Runtime Fabric** | Either Properties in Runtime Manager, OR Kubernetes Secret mounted via `<secure-properties:config>`. Document the choice in `PROJECT_CONTEXT.md`. |
+| **Production (any target)** | Strongly prefer encrypted `secure-properties.yaml` (committed) + a single `runtime.encryption.key` injected at deploy time. Plain Runtime Manager properties are acceptable for tokens that rotate; long-lived passwords should be in the encrypted file. |
+
+The agent MUST NEVER suggest copying `.env` into the deployment, baking it into the JAR, or committing it. If a developer asks "can I just put `.env` next to the JAR on the server?", say no and direct them to the table above.
+
+If the user explicitly says "I'm deploying to <X>", the agent MUST proactively walk through the matching row, list the exact key names that need to be set (read them from `.env.example`, NEVER from `.env`), and remind them which ones to mark as secured/encrypted.
+
+---
+
+## End-of-Development Checklist — MUST Show to User
+
+When a development task is complete (feature shipped, code generated, tests written), the agent MUST end its response with a copy-pasteable checklist that the developer ticks off before running locally. The checklist MUST include — at minimum — these items, customised to what was added:
+
+```
+## Before you run locally — please complete:
+
+- [ ] Open `.env` and replace ALL `replace-with-real-value` placeholders with real credentials:
+      - SFDC_USERNAME
+      - SFDC_PASSWORD
+      - SFDC_SECURITY_TOKEN
+      (and any other secrets added this session)
+- [ ] Confirm `.env` is gitignored (run: `git check-ignore .env` — should print `.env`)
+- [ ] In Anypoint Code Builder: open `global-configs.xml` → click each connector config → Test Connection
+- [ ] Hit F5 (or Run > Start Debugging) → pick "Run Mule App (with .env)"
+- [ ] Wait for `DEPLOYED` in the log (~60–90s)
+- [ ] Smoke-test endpoints with Invoke-RestMethod (see commands below)
+
+## Smoke-test commands
+(...PowerShell Invoke-RestMethod for each new endpoint...)
+```
+
+Tailor the checklist to the actual work done in that session — drop items that don't apply, add items for new connectors / endpoints / env vars introduced. The variable list under "replace placeholders" MUST match exactly what's in `.env`.
+
+If the session did NOT add any new secrets and `.env` already has real values, the checklist may skip the placeholder-replacement step but should still surface the connection test + smoke test.
+
+---
+
+## `PROJECT_CONTEXT.md` Template
+
+When creating the file, use this exact structure (fill what you have, mark unknowns as `TBD — ask user`):
+
+```markdown
+# Project Context
+
+> Single source of truth for this Mule project. Edit freely. The agent reads this before any code work and updates it after every meaningful change. **No secret values in this file — only secret variable names.**
+
+## 1. Overview
+- **Name**:
+- **Purpose**: (1 sentence)
+- **Owner**:
+- **Repo**:
+
+## 2. Runtime
+- **Mule version**:
+- **Java version**:
+- **HTTP host**:
+- **HTTP port**:
+- **HTTP basePath**:
+- **TLS**: (yes/no, cert location)
+
+## 3. API Style
+- **Style**: (REST / SOAP)
+- **Spec format**: (RAML 1.0 / OAS 3.0)
+- **Versioning**: (URI segment / header)
+- **API auth**: (none / API key / OAuth / mTLS)
+- **Standard error shape**: `{ code: string, message: string }`
+
+## 4. API Inventory
+| Path | Method | Flow name | Spec status | Impl status | Test status |
+|---|---|---|---|---|---|
+
+## 5. Connector Inventory
+| System | Mule config name | Auth type | Endpoint / host | Secret variable names | Env-specific |
+|---|---|---|---|---|---|
+
+## 6. Environments
+| Env | Property file | How selected | Notes |
+|---|---|---|---|
+| local | config-local.yaml | `-Denv=local` | |
+
+## 7. Secrets Management
+- **Mechanism (per env)**:
+- **Variable names required**: (list)
+- **Where stored**: (env vars / secure-properties.yaml path / Anypoint Vault key prefix)
+
+## 8. Logging & Error Handling
+- **Log level (per env)**:
+- **Error type → HTTP status mapping**:
+  - APP:BAD_REQUEST → 400
+  - APP:NOT_FOUND → 404
+  - APP:CONFLICT → 409
+  - APP:UNAUTHORIZED → 401
+  - APP:FORBIDDEN → 403
+  - SALESFORCE:CONNECTIVITY → 503
+  - DB:CONNECTIVITY → 503
+  - ANY → 500
+
+## 9. Testing
+- **MUnit coverage target**:
+- **Test data location**: `src/test/resources/`
+
+## 10. Decisions Log
+- (date) — decision — rationale
+
+## 11. Open Questions / TBD
+- (list anything still unknown so the agent re-asks at next opportunity)
+```
+
+---
+
+## Updating the Context File
+
+The agent MUST update `PROJECT_CONTEXT.md` in the SAME RESPONSE as the code change when:
+
+- A new endpoint is added → row added to API Inventory
+- A new connector config is added → row added to Connector Inventory + secrets section updated
+- A new environment is introduced → row added to Environments
+- A naming/architecture decision is made → entry added to Decisions Log
+- A question is raised the user can't answer right now → entry added to Open Questions
+
+Treat this file as the project's memory. If it's wrong, every future chat is wrong.
+
+---
+
+## Meta-Rule: Improving the Rules
+
+If the agent encounters a project detail that doesn't fit any template section above, OR a recurring question pattern that should be standardised, the agent should:
+
+1. Add the detail to `PROJECT_CONTEXT.md` (project state)
+2. Propose a small addition to this rule (`mule-init-context.mdc`) so future projects benefit — show the diff to the user and let them approve before writing

@@ -1,0 +1,399 @@
+---
+description: MuleSoft Salesforce connector standards (query, insert, upsert, bulk, mocking)
+globs: **/src/main/mule/**/*.xml, **/pom.xml
+alwaysApply: false
+---
+
+# Mule Salesforce Connector
+
+The Mule Salesforce connector (`mule-salesforce-connector`) supports SOAP, REST, Bulk API, Streaming API, and Composite API against any Salesforce org (Sandbox or Production).
+
+## 1. Add Dependency
+
+In `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>com.mulesoft.connectors</groupId>
+  <artifactId>mule-salesforce-connector</artifactId>
+  <version>11.1.0</version>
+  <classifier>mule-plugin</classifier>
+</dependency>
+```
+
+## 2. Global Config (in `global-configs.xml`)
+
+Salesforce supports several auth flows. Pick ONE per org:
+
+### Username + Password + Security Token (simplest, dev/test)
+```xml
+<sfdc:sfdc-config name="Salesforce_Org_config" doc:name="Salesforce Org">
+  <sfdc:basic-connection
+      username="${sfdc.username}"
+      password="${sfdc.password}"
+      securityToken="${sfdc.token}"
+      url="${sfdc.url}"/>
+</sfdc:sfdc-config>
+```
+
+### CRITICAL: pick the right login endpoint per org type
+
+The agent MUST ask the user "what type of Salesforce org is this?" during init and pick the right endpoint. Wrong endpoint always returns `INVALID_LOGIN: Invalid username, password, security token` — looks like a credential issue but isn't.
+
+| Org type | SOAP login endpoint | Notes |
+|---|---|---|
+| **Production** | `https://login.salesforce.com/services/Soap/u/59.0` | The "real" org |
+| **Developer Edition** | `https://login.salesforce.com/services/Soap/u/59.0` | Free standalone dev org from developer.salesforce.com — uses the **production** endpoint, NOT the sandbox endpoint |
+| **Sandbox** (Dev/UAT/Full) | `https://test.salesforce.com/services/Soap/u/59.0` | Forked off a Production org. Username usually has a `.sandboxname` suffix (e.g. `you@company.com.dev1`). |
+| **Trailhead Playground** | `https://login.salesforce.com/services/Soap/u/59.0` | Same as Developer Edition |
+| **My Domain enabled** (any) | `https://<mydomain>.my.salesforce.com/services/Soap/u/59.0` | Org-specific URL; required if Production has My Domain login enforcement |
+
+Never hardcode the URL in `global-configs.xml` — put it in `config.yaml` as `sfdc.url` so it can change per environment without touching XML.
+
+### OAuth JWT Bearer (recommended for prod / server-to-server)
+```xml
+<sfdc:sfdc-config name="Salesforce_Prod_config" doc:name="Salesforce Prod">
+  <sfdc:oauth-jwt-connection
+      consumerKey="${sfdc.consumerKey}"
+      keyStore="keystores/sfdc.jks"
+      storePassword="${sfdc.storePassword}"
+      principal="${sfdc.principal}"
+      audienceUrl="https://login.salesforce.com"/>
+</sfdc:sfdc-config>
+```
+
+## 3. `config.yaml` Properties
+
+```yaml
+sfdc:
+  username: "integration@acme.com.sandbox"
+  # password and token live in env vars or secure-properties — NEVER here
+```
+
+For secrets, NEVER inline credentials in YAML/XML and NEVER use `${env.X}` in property files — Mule 4 does not auto-resolve `${env.X}` to OS environment variables. Either:
+
+- Inject as JVM system properties at launch (e.g. `mule.bat console -M-Dsfdc.password=...`) and reference `${sfdc.password}` from `global-configs.xml`, OR
+- Use an encrypted `secure-properties.yaml` (CloudHub / on-prem secure properties module).
+
+See `mule-init-context.mdc` "CRITICAL Mule Property Resolution Gotcha" for full details.
+
+## 4. Operations
+
+### Insert (Create) — single record
+```xml
+<sfdc:create config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Create Account">
+  <sfdc:records>#[[{
+    Name: payload.name,
+    Industry: payload.industry default "Other",
+    BillingCity: payload.city
+  }]]</sfdc:records>
+</sfdc:create>
+```
+**Result shape**: see §5 — the connector returns `{ successful, items: [{ successful, id, payload: { success, id, errors }, ... }] }`. Read results from `payload.items[0]`, NOT `payload[0]`. The §7 pattern shows the correct success/error extraction.
+
+### Insert — multiple records
+```xml
+<sfdc:create config-ref="Salesforce_Sandbox_config" type="Contact" doc:name="Create Contacts">
+  <sfdc:records>#[payload map { FirstName: $.firstName, LastName: $.lastName, Email: $.email, AccountId: vars.accountId }]</sfdc:records>
+</sfdc:create>
+```
+
+### Upsert (insert-or-update by external Id)
+```xml
+<sfdc:upsert config-ref="Salesforce_Sandbox_config"
+             type="Account"
+             externalIdFieldName="External_Id__c"
+             doc:name="Upsert Account">
+  <sfdc:records>#[[{ External_Id__c: payload.externalId, Name: payload.name }]]</sfdc:records>
+</sfdc:upsert>
+```
+
+### Update — by Salesforce Id
+```xml
+<sfdc:update config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Update Account">
+  <sfdc:records>#[[{ Id: vars.accountId, Industry: payload.industry }]]</sfdc:records>
+</sfdc:update>
+```
+
+### Delete
+```xml
+<sfdc:delete config-ref="Salesforce_Sandbox_config" doc:name="Delete Account">
+  <sfdc:ids>#[[vars.accountId]]</sfdc:ids>
+</sfdc:delete>
+```
+
+### Query (SOQL)
+```xml
+<sfdc:query config-ref="Salesforce_Sandbox_config" doc:name="Query top accounts">
+  <sfdc:salesforce-query>SELECT Id, Name, Industry FROM Account WHERE Industry = ':industry' LIMIT 50</sfdc:salesforce-query>
+  <sfdc:parameters>#[{ industry: vars.industry }]</sfdc:parameters>
+</sfdc:query>
+```
+
+### Bulk Insert (10K+ records)
+```xml
+<sfdc:create-bulk config-ref="Salesforce_Sandbox_config" type="Contact" doc:name="Bulk insert Contacts">
+  <sfdc:records>#[payload]</sfdc:records>
+</sfdc:create-bulk>
+```
+Use Bulk for > ~2000 records. Returns a `jobId` you can poll with `<sfdc:get-job-info>` and `<sfdc:get-batch-result>`.
+
+## 5. The ACTUAL response shape from `sfdc:create` / `sfdc:update` / `sfdc:upsert`
+
+The Mule SF connector returns a **BatchOperationResult** — NOT a flat `SaveResult` array. This is the most common cause of "my success check doesn't fire" or "I get 'no errors[]' even though SF rejected the record". Verified shape:
+
+```json
+{
+  "successful": true,                      // overall batch success
+  "id": null,                              // overall id (usually null for batches)
+  "items": [                               // one entry per submitted record
+    {
+      "successful": true,                  // per-record success
+      "id": "001fj00001AjjqjAAB",          // SF Id when created
+      "exception": null,                   // populated only on connector/SOAP fault
+      "message": null,                     // top-level error msg if any
+      "statusCode": null,                  // top-level status if any
+      "payload": {                         // the actual SaveResult from SF
+        "success": true,
+        "id": "001fj00001AjjqjAAB",
+        "errors": [                        // populated on SF business rejection
+          { "statusCode": "INVALID_FIELD", "message": "BillingCountry: ...", "fields": ["BillingCountry"] }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Always read `payload.items[N]` — never `payload[N]` — for SF results.** A single-record create still returns `items: [...]` with one entry.
+
+## 6. MUST Rules
+
+- **One global config per org** (Sandbox vs Prod), reused across all flows.
+- **Always set `type` attribute** on create/update/upsert/delete so the connector knows the SObject.
+- **The `<sfdc:records>` payload MUST be a list `[{...}]`**, even for a single record. Wrap with `[ ... ]`.
+- **Read results from `payload.items[N]`**, NOT `payload[N]`. See response shape above.
+- **Treat `items[N].successful != true`** as a failure. Pull `items[N].payload.errors[0].statusCode` + `.message` + `.fields` for diagnostics.
+- **NEVER hard-code credentials** in XML. Use `${...}` properties bound to env vars or secure-properties.
+- **Test the connection** in ACB: open `global-configs.xml` → click the Salesforce config → "Test Connection".
+
+## 7. User-Friendly Error Responses — MANDATORY pattern
+
+Every flow that calls Salesforce MUST surface SF errors in a clean, actionable JSON shape — never dump raw connector payloads to API consumers. The agent MUST follow this exact pattern:
+
+### Step 1 — In the SUB-FLOW, capture two variables before raising
+
+```xml
+<ee:transform doc:name="Capture Salesforce error">
+  <ee:variables>
+    <ee:set-variable variableName="sfErrorCode"><![CDATA[%dw 2.0
+output application/java
+var item  = (payload.items default [])[0] default {}
+var errs  = (item.payload.errors default [])
+var first = if (sizeOf(errs) > 0) errs[0] else {}
+---
+(first.statusCode default item.statusCode default "SALESFORCE_REJECTED") as String]]></ee:set-variable>
+    <ee:set-variable variableName="sfErrorMessage"><![CDATA[%dw 2.0
+output application/java
+var item   = (payload.items default [])[0] default {}
+var errs   = (item.payload.errors default [])
+var first  = if (sizeOf(errs) > 0) errs[0] else {}
+var fields = first.fields default []
+var msg    = first.message default item.message default item.exception.detailMessage default "Salesforce rejected the request"
+---
+(if (sizeOf(fields) > 0) (msg ++ " (fields: " ++ (fields joinBy ", ") ++ ")") else msg) as String]]></ee:set-variable>
+  </ee:variables>
+</ee:transform>
+<logger level="WARN" message="#['SFDC FAILED: ' ++ vars.sfErrorCode ++ ' - ' ++ vars.sfErrorMessage]"/>
+<raise-error type="APP:SALESFORCE_ERROR" description="#[vars.sfErrorCode ++ ': ' ++ vars.sfErrorMessage]"/>
+```
+
+### Step 2 — In the OUTER error handler, map SF statusCode to HTTP status
+
+```xml
+<on-error-propagate type="APP:SALESFORCE_ERROR" doc:name="Salesforce rejected">
+  <ee:transform doc:name="Map SF statusCode to HTTP">
+    <ee:variables>
+      <ee:set-variable variableName="errorCode">#[vars.sfErrorCode default "SALESFORCE_REJECTED"]</ee:set-variable>
+      <ee:set-variable variableName="errorMessage">#[vars.sfErrorMessage default error.description]</ee:set-variable>
+      <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/java
+var c = vars.sfErrorCode default ""
+---
+(if (c == "INVALID_FIELD" or c == "REQUIRED_FIELD_MISSING" or c == "STRING_TOO_LONG" or c == "INVALID_DATE_FORMAT" or c == "INVALID_TYPE_ON_FIELD_IN_RECORD" or c == "MALFORMED_ID") 400
+ else if (c == "DUPLICATE_VALUE" or c == "DUPLICATE_VALUE_DETECTED") 409
+ else if (c == "REQUEST_LIMIT_EXCEEDED" or c == "STORAGE_LIMIT_EXCEEDED") 429
+ else if (c == "INSUFFICIENT_ACCESS_OR_READONLY" or c == "INSUFFICIENT_ACCESS_ON_CROSS_REFERENCE_ENTITY") 403
+ else 422) as Number]]></ee:set-variable>
+    </ee:variables>
+  </ee:transform>
+</on-error-propagate>
+```
+
+### Result — what the API consumer sees
+
+```json
+// 400 — caller's input is malformed
+{ "code": "INVALID_FIELD", "message": "BillingCountry: invalid country code 'XYZ' (fields: BillingCountry)" }
+
+// 409 — uniqueness violated
+{ "code": "DUPLICATE_VALUE", "message": "duplicate value found: ExternalId__c (fields: ExternalId__c)" }
+
+// 422 — generic SF business rejection
+{ "code": "FIELD_CUSTOM_VALIDATION_EXCEPTION", "message": "Account name must start with capital letter" }
+
+// 503 — SF unreachable (handled by SALESFORCE:CONNECTIVITY handler, separate)
+{ "code": "SALESFORCE_UNAVAILABLE", "message": "Connection refused" }
+```
+
+NEVER return:
+- Raw connector payloads (no `items: [...]` in API responses)
+- Generic strings like "Salesforce rejected the request" — always include the `statusCode` and the actual `message`
+- Stack traces or `error.description` directly without unwrapping it through this pattern
+
+## 8. SF statusCode → HTTP status mapping (canonical)
+
+| SF statusCode | HTTP | Meaning |
+|---|---|---|
+| `INVALID_FIELD` | 400 | Caller sent an unknown/invalid field value |
+| `REQUIRED_FIELD_MISSING` | 400 | Required field not provided |
+| `STRING_TOO_LONG` | 400 | Value exceeds field max length |
+| `INVALID_DATE_FORMAT` | 400 | Date couldn't be parsed |
+| `MALFORMED_ID` | 400 | SF Id format invalid |
+| `DUPLICATE_VALUE` / `_DETECTED` | 409 | Unique constraint hit |
+| `REQUEST_LIMIT_EXCEEDED` | 429 | Org API limit |
+| `STORAGE_LIMIT_EXCEEDED` | 429 | Org storage limit |
+| `INSUFFICIENT_ACCESS_OR_READONLY` | 403 | User lacks permission |
+| `FIELD_CUSTOM_VALIDATION_EXCEPTION` | 422 | A validation rule fired |
+| `INVALID_FIELD_FOR_INSERT_UPDATE` | 422 | Field exists but not writable here |
+| anything else | 422 | Generic SF business rejection |
+
+## 9. Inserting Salesforce Records — Reference Flow (uses the patterns above)
+
+Validate input → transform to SF object → create → check `items[0].successful` → return id, OR capture SF error and raise with the user-friendly pattern from §7.
+
+```xml
+<flow name="accounts-create-flow">
+  <http:listener config-ref="HTTP_Listener_config" path="/api/v1/accounts" allowedMethods="POST" doc:name="POST /accounts">
+    <http:response statusCode="201"/>
+    <http:error-response statusCode="#[vars.httpStatus default 500]">
+      <http:body>#[output application/json --- { code: vars.errorCode, message: vars.errorMessage }]</http:body>
+    </http:error-response>
+  </http:listener>
+
+  <ee:transform doc:name="Map to SF Account">
+    <ee:message>
+      <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+  Name: payload.name default "",
+  Industry: payload.industry default "Other",
+  BillingCity: payload.city
+}]
+]]></ee:set-payload>
+    </ee:message>
+  </ee:transform>
+
+  <sfdc:create config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Create Account"/>
+
+  <choice doc:name="Check SF result">
+    <when expression="#[((payload.items default [])[0].successful default false) == true]">
+      <ee:transform doc:name="Build 201 response">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var item = (payload.items default [])[0] default {}
+---
+{ id: item.id default item.payload.id default "(no-id)", status: "created" }
+]]></ee:set-payload>
+        </ee:message>
+      </ee:transform>
+    </when>
+    <otherwise>
+      <!-- Capture using the §7 pattern -->
+      <ee:transform doc:name="Capture SF error">
+        <ee:variables>
+          <ee:set-variable variableName="sfErrorCode"><![CDATA[%dw 2.0
+output application/java
+var item  = (payload.items default [])[0] default {}
+var errs  = (item.payload.errors default [])
+var first = if (sizeOf(errs) > 0) errs[0] else {}
+---
+(first.statusCode default item.statusCode default "SALESFORCE_REJECTED") as String]]></ee:set-variable>
+          <ee:set-variable variableName="sfErrorMessage"><![CDATA[%dw 2.0
+output application/java
+var item   = (payload.items default [])[0] default {}
+var errs   = (item.payload.errors default [])
+var first  = if (sizeOf(errs) > 0) errs[0] else {}
+var fields = first.fields default []
+var msg    = first.message default item.message default item.exception.detailMessage default "Salesforce rejected the request"
+---
+(if (sizeOf(fields) > 0) (msg ++ " (fields: " ++ (fields joinBy ", ") ++ ")") else msg) as String]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+      <raise-error type="APP:SALESFORCE_ERROR" description="#[vars.sfErrorCode ++ ': ' ++ vars.sfErrorMessage]"/>
+    </otherwise>
+  </choice>
+
+  <error-handler>
+    <on-error-propagate type="SALESFORCE:CONNECTIVITY">
+      <ee:transform>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">503</ee:set-variable>
+          <ee:set-variable variableName="errorCode">#["SALESFORCE_UNAVAILABLE"]</ee:set-variable>
+          <ee:set-variable variableName="errorMessage">#[error.description]</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+    <on-error-propagate type="APP:SALESFORCE_ERROR">
+      <!-- Uses the §7 mapping (vars.sfErrorCode → HTTP) -->
+      <ee:transform>
+        <ee:variables>
+          <ee:set-variable variableName="errorCode">#[vars.sfErrorCode default "SALESFORCE_REJECTED"]</ee:set-variable>
+          <ee:set-variable variableName="errorMessage">#[vars.sfErrorMessage default error.description]</ee:set-variable>
+          <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/java
+var c = vars.sfErrorCode default ""
+---
+(if (c == "INVALID_FIELD" or c == "REQUIRED_FIELD_MISSING" or c == "STRING_TOO_LONG" or c == "MALFORMED_ID") 400
+ else if (c == "DUPLICATE_VALUE" or c == "DUPLICATE_VALUE_DETECTED") 409
+ else if (c == "REQUEST_LIMIT_EXCEEDED" or c == "STORAGE_LIMIT_EXCEEDED") 429
+ else if (c == "INSUFFICIENT_ACCESS_OR_READONLY") 403
+ else 422) as Number]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+    <on-error-propagate type="ANY">
+      <ee:transform>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+          <ee:set-variable variableName="errorCode">#["INTERNAL_ERROR"]</ee:set-variable>
+          <ee:set-variable variableName="errorMessage">#[error.description default "Unexpected error"]</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+  </error-handler>
+</flow>
+```
+
+## 10. Common Errors
+
+| Error type | Cause | Fix |
+|---|---|---|
+| `SALESFORCE:INVALID_SESSION_ID` | Token expired | Connector auto-refreshes; if persists, check creds |
+| `SALESFORCE:CONNECTIVITY` | Network / org down / wrong url | Verify Sandbox vs Prod URL |
+| `INVALID_FIELD` in `errors[]` | Field name typo or invalid value | Check SObject in Salesforce Setup; surface via §7 pattern |
+| `REQUIRED_FIELD_MISSING` | A required SObject field wasn't supplied | Add it in the DataWeave mapping |
+| `DUPLICATE_VALUE` | Hit a unique constraint | Use `upsert` instead of `create` |
+| Mule reports success but caller sees `SALESFORCE_REJECTED` | Reading `payload[0]` instead of `payload.items[0]` | Apply §6 + §7 patterns |
+
+## 11. Local Testing
+
+Mock the Salesforce connector in MUnit (see `mule-testing-munit.mdc`). For end-to-end, point the global config at a **Salesforce Developer Sandbox** — never test against Production.
+
+```powershell
+$body = @{ name = "Acme Inc"; industry = "Technology"; city = "London" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://localhost:8081/api/v1/accounts" `
+  -Method POST -Body $body -ContentType "application/json"
+```

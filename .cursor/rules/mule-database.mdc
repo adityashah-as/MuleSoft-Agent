@@ -1,0 +1,152 @@
+---
+description: MuleSoft Database connector standards (works with any JDBC database)
+globs: **/src/main/mule/**/*.xml, **/pom.xml
+alwaysApply: false
+---
+
+# Mule Database Connector
+
+The Mule Database connector (`mule-db-connector`) works with **any JDBC-compliant database** — MySQL, PostgreSQL, Oracle, SQL Server, MariaDB, H2, DB2, Snowflake (via JDBC), etc. Only the JDBC driver dependency and the `<db:*-connection>` element change between databases.
+
+## 1. Add Dependencies
+
+In `pom.xml`, add the connector AND the JDBC driver. The driver is nested under the connector dep:
+
+```xml
+<dependency>
+  <groupId>org.mule.connectors</groupId>
+  <artifactId>mule-db-connector</artifactId>
+  <version>1.14.5</version>
+  <classifier>mule-plugin</classifier>
+  <!-- nest the JDBC driver here -->
+</dependency>
+```
+
+JDBC driver coordinates by DB:
+
+| Database | groupId:artifactId:version |
+|---|---|
+| MySQL | `mysql:mysql-connector-java:8.0.33` |
+| PostgreSQL | `org.postgresql:postgresql:42.7.3` |
+| Oracle | `com.oracle.database.jdbc:ojdbc11:23.3.0.23.09` |
+| SQL Server | `com.microsoft.sqlserver:mssql-jdbc:12.6.1.jre11` |
+| MariaDB | `org.mariadb.jdbc:mariadb-java-client:3.3.3` |
+| H2 (testing) | `com.h2database:h2:2.2.224` |
+
+## 2. Global Config (in `global-configs.xml`)
+
+**MySQL example:**
+```xml
+<db:config name="MySQL_DB_config" doc:name="MySQL DB Config">
+  <db:my-sql-connection
+      host="${db.host}" port="${db.port}"
+      user="${db.user}" password="${db.password}"
+      database="${db.name}"/>
+</db:config>
+```
+
+**PostgreSQL:** swap the connection element to `<db:postgresql-connection ...>`.
+**SQL Server:** `<db:mssql-connection ...>`.
+**Oracle:** `<db:oracle-connection ...>` (uses `instance` instead of `database`).
+
+**Generic / any other JDBC DB**:
+```xml
+<db:config name="Generic_DB_config" doc:name="Generic JDBC Config">
+  <db:generic-connection
+      url="${db.url}"
+      driverClassName="${db.driverClass}"
+      user="${db.user}" password="${db.password}"/>
+</db:config>
+```
+
+## 3. `config.yaml` Properties
+
+```yaml
+db:
+  host: "localhost"
+  port: "3306"
+  name: "appdb"
+  user: "appuser"
+  # password lives in secure-properties or env vars — NEVER here
+```
+
+For secrets use simple property keys in XML (e.g. `${db.password}`) supplied at runtime via JVM system properties (`-M-Ddb.password=...` from your launch script or `wrapper.conf`), or `${secure::db.password}` with `secure-properties.yaml` and `secure-properties-tools`. Do **not** use `${env.DB_PASSWORD}` in YAML/XML expecting it to read the OS environment — see `mule-init-context.mdc`.
+
+## 4. Operations
+
+### SELECT
+```xml
+<db:select config-ref="MySQL_DB_config" doc:name="Get customer by id">
+  <db:sql>SELECT id, name, email FROM customers WHERE id = :id</db:sql>
+  <db:input-parameters>#[{ id: vars.customerId }]</db:input-parameters>
+</db:select>
+```
+Result: a list of maps. Use DataWeave to shape it for the response.
+
+### INSERT (with generated key)
+```xml
+<db:insert config-ref="MySQL_DB_config" doc:name="Insert customer" autoGenerateKeys="true">
+  <db:sql>INSERT INTO customers (name, email) VALUES (:name, :email)</db:sql>
+  <db:input-parameters>#[{ name: payload.name, email: payload.email }]</db:input-parameters>
+  <db:auto-generated-keys-column-names>
+    <db:auto-generated-keys-column-name value="id"/>
+  </db:auto-generated-keys-column-names>
+</db:insert>
+```
+Result shape: `{ affectedRows: 1, generatedKeys: { id: 42 } }`.
+
+### UPDATE
+```xml
+<db:update config-ref="MySQL_DB_config" doc:name="Update customer">
+  <db:sql>UPDATE customers SET email = :email WHERE id = :id</db:sql>
+  <db:input-parameters>#[{ email: payload.email, id: vars.customerId }]</db:input-parameters>
+</db:update>
+```
+Check `payload.affectedRows` — if `0`, raise `APP:NOT_FOUND`.
+
+### DELETE
+```xml
+<db:delete config-ref="MySQL_DB_config" doc:name="Delete customer">
+  <db:sql>DELETE FROM customers WHERE id = :id</db:sql>
+  <db:input-parameters>#[{ id: vars.customerId }]</db:input-parameters>
+</db:delete>
+```
+
+### BULK INSERT
+```xml
+<db:bulk-insert config-ref="MySQL_DB_config" doc:name="Bulk insert customers">
+  <db:sql>INSERT INTO customers (name, email) VALUES (:name, :email)</db:sql>
+  <db:bulk-input-parameters>#[payload map { name: $.name, email: $.email }]</db:bulk-input-parameters>
+</db:bulk-insert>
+```
+
+## 5. MUST Rules
+
+- **Always use parameterised SQL** with `:paramName` placeholders + `<db:input-parameters>`. NEVER concatenate strings — that's SQL injection.
+- **SQL goes in flow XML**, not in DataWeave.
+- **One global config per logical database**, reused everywhere — never duplicate.
+- **Wrap operations in `<try>`** with an error handler mapping `DB:CONNECTIVITY` → 503, `DB:BAD_SQL_SYNTAX` → 500, `DB:QUERY_EXECUTION` → 500.
+- **Test the connection** in ACB: open `global-configs.xml` → click the config → "Test Connection" button.
+
+## 6. Common Errors
+
+| Error type | Likely cause | Fix |
+|---|---|---|
+| `DB:CONNECTIVITY` | Wrong host/port/credentials, DB not running | Verify `config.yaml`, ping the DB |
+| `Driver class not found` | JDBC driver dep missing | Add driver as nested dep under `mule-db-connector` |
+| `DB:BAD_SQL_SYNTAX` | Typo in SQL | Run the SQL directly against the DB to confirm |
+| `DB:QUERY_EXECUTION` | Constraint violation (FK, unique) | Catch & map to `APP:CONFLICT` → 409 |
+
+## 7. Local Testing
+
+Spin up a disposable DB in Docker for local dev:
+
+```powershell
+docker run --name mule-mysql -e MYSQL_ROOT_PASSWORD=secret -e MYSQL_DATABASE=appdb -p 3306:3306 -d mysql:8
+```
+
+Then verify with:
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8081/api/v1/customers" -Method POST `
+  -Body (@{name="Acme"; email="a@b.com"} | ConvertTo-Json) -ContentType "application/json"
+```

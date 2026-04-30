@@ -1,0 +1,274 @@
+---
+description: DataWeave 2.0 standards for inline expressions and external .dwl modules
+globs: **/*.dwl, **/src/main/mule/**/*.xml
+alwaysApply: false
+---
+
+# DataWeave 2.0 Rules
+
+## Header Standards
+
+1. Always start with `%dw 2.0`.
+2. Always declare `output` matching the consumer: `application/json`, `application/xml`, `application/java`, `application/csv`, etc.
+3. **Exactly ONE `---` separator** between header and body — never two. ALL header items (`output`, `var`, `fun`, `ns`, `import`) go ABOVE the single `---`.
+
+```dw
+%dw 2.0
+output application/json
+---
+{ id: payload.id, name: payload.name }
+```
+
+### With multiple `var` declarations
+
+```dw
+%dw 2.0
+output application/java
+var first = if (payload is Array) (payload[0] default {}) else (payload default {})
+var errs  = first.errors default []
+---
+if (sizeOf(errs) > 0)
+  errs[0].message
+else
+  "no errors"
+```
+
+### WRONG — second `---` mid-script breaks the parser
+
+```dw
+%dw 2.0
+output application/java
+---                       <- this ends the header
+var first = ...           <- 'var' is invalid in body, parser fails: "Invalid input 'f'"
+---
+<body>
+```
+
+The parser error looks like `Invalid input 'f', expected Attribute<'@(Name:Value)+')'> or ~ (line 4, column 5)` — column 5 is the `f` of `var first`, because once the body has started, `var` is no longer a valid keyword.
+
+## File Layout
+
+External `.dwl` modules live in `src/main/resources/dwl/` and are referenced via:
+
+```xml
+<ee:set-payload resource="dwl/customer-mapping.dwl"/>
+```
+
+- **Inline DWL** for simple transforms (< 5 lines)
+- **External `.dwl`** for anything larger or reused across flows
+- Test inputs/expected outputs go in `src/test/resources/`
+
+## Null-Safety
+
+Always use the `default` operator on optional fields:
+
+```dw
+{ name: payload.name default "", email: payload.email default null }
+```
+
+## Identifier Rules — Lambda Parameters & Variables
+
+Every identifier in DataWeave (lambda parameter, `var` name, function name, key) MUST be a real name: starts with a letter (a-z, A-Z), then alphanumeric or `_`. The following are **NOT valid identifiers** and the parser fails with `Invalid input '<char>', expected ')'`:
+
+| Wrong | Why | Right |
+|---|---|---|
+| `(_, idx) -> idx > 0` | `_` alone is not a legal identifier in DW (unlike Scala/Rust/Kotlin/Python) | `(item, idx) -> idx > 0` — give every param a real name even if unused |
+| `(*, idx) -> ...` | `*` is the spread operator, not a placeholder | same as above |
+| `(, idx) -> ...` | empty positional placeholder doesn't exist | same as above |
+| `var 1stItem = ...` | identifiers can't start with a digit | `var firstItem = ...` |
+| `var item-name = ...` | hyphens are subtraction, not part of names | `var itemName = ...` |
+
+The single legal "shortcut" identifiers are `$`, `$$`, `$$$` — **only inside single-arg-lambda shorthand** (`payload map upper($)`), never as named parameters in `(x, y) -> ...` form.
+
+## Anti-Patterns Imported from Other Languages — DON'T
+
+The model (and devs coming from JS/Scala/Python) constantly leaks foreign idioms into DW. None of these compile:
+
+| You'd write in… | …but in DataWeave use |
+|---|---|
+| Scala/Rust `_` for unused param | A real name: `(item, idx) -> ...`, or skip the index entirely with a slice (see below) |
+| JS `arr.slice(1)` | `arr[1 to -1]` |
+| JS `arr.length` | `sizeOf(arr)` |
+| JS `arr.includes(x)` | `arr contains x` |
+| JS `JSON.parse(s)` | `read(s, "application/json")` |
+| JS `JSON.stringify(o)` | `write(o, "application/json")` |
+| JS ternary `cond ? a : b` | `if (cond) a else b` |
+| JS `await` / `async` | DW is pure & synchronous — has no concept |
+| Python `for x in xs:` | `xs map (x) -> ...` |
+| Python list comprehension `[f(x) for x in xs if p(x)]` | `xs filter p map f` |
+| Python `xs[1:]` | `xs[1 to -1]` |
+| Python `len(xs)` | `sizeOf(xs)` |
+| Java `null != x` | `x != null` (or `x?` selector for null-safe nav) |
+| Java `try { ... } catch ...` | DW has no try/catch — push validation into Mule `<choice>` + `<raise-error>` |
+| Kotlin `it` inside lambda | `$` (only in single-arg shorthand) |
+
+## Slicing & Skipping — One Idiom Per Job
+
+Whenever you're tempted to write `filter ((_, idx) -> idx > N)`, STOP. Use a slice instead — clearer and avoids the `_` trap entirely.
+
+| Goal | Idiom |
+|---|---|
+| Skip first element (e.g. CSV header row) | `lines[1 to -1]` |
+| Skip first N elements | `arr[N to -1]` |
+| Take only first N | `arr[0 to N-1]` |
+| Last element | `arr[-1]` |
+| Last N elements | `arr[-N to -1]` |
+| Reverse | `arr[-1 to 0]` |
+| Range as an array | `1 to 10` produces `[1, 2, ..., 10]` |
+
+If the array might be shorter than `N`, the slice safely returns whatever exists (no `IndexOutOfBounds`). Always pair with an `if (sizeOf(arr) < N+1) [] else arr[N to -1]` guard if your downstream code can't handle an empty array.
+
+## Forbidden Patterns — String-Match Blocklist (check BEFORE writing any DW)
+
+Before writing any `<![CDATA[%dw 2.0 ...]]>` block, the agent MUST mentally grep its own draft for these literal substrings. Each one is a known-broken pattern that the agent has historically shipped and that the user has had to debug. If the draft contains ANY of them, rewrite it before sending — DO NOT ship and rely on the deploy/runtime to catch it.
+
+| Forbidden substring | Why it breaks | Fix |
+|---|---|---|
+| `encoding: "UTF-8"` (or `encoding:"UTF-8"`) inside a `readUrl(...)` / `read(...)` reader-properties object | `encoding` is a WRITER-only property for CSV/JSON/XML/text. Runtime fails: `Option 'encoding' is not valid. Valid options are: streaming, separator, quote, escape, bodyStartLineNumber, ignoreEmptyLine, header, headerLineNumber` | Move encoding to the MIME type: `"application/csv;charset=UTF-8"` and drop `encoding` from the third arg |
+| `as String { encoding:` | `as String` does NOT accept reader properties — the block is silently ignored, then `readUrl` falls back to `application/dw` and the file is parsed as a DW script | Use `readUrl(url, "<mime>;charset=UTF-8", { ... })` with the right MIME type |
+| `readUrl(<url>)` with NO second arg | Defaults to `application/dw`; tries to parse the file as a DataWeave script. Runtime fails: `Exception while reading '...' as 'application/dw'` | Always pass an explicit MIME type as the second arg |
+| `var input = payload` in the header | `payload` cannot be aliased in the header — parser rejects | Reference `payload` directly in the body |
+| `error(...)` as a DW function | Not a real DW function | Use Mule `<choice>` + `<raise-error>` instead |
+| `splitBy ","` to parse a CSV manually | Fragile — breaks on quoted commas, escapes, multi-line cells. Almost always means `readUrl` was called wrong (no MIME type) | Fix the `readUrl` MIME type; drop the manual parser |
+| `payload[0]` for a Salesforce connector result | SF connector returns `{ items: [...] }` — `payload[0]` is undefined | Use `payload.items[0]` (see `mule-salesforce.mdc` §5) |
+| `(_, idx) ->` or `(*, idx) ->` lambda parameters | `_` / `*` are not valid DW identifiers — parser fails with `Invalid input '_'` | Give every param a real name, or use a slice: `arr[1 to -1]` |
+| `]]]>` at the end of a CDATA block | XML closes CDATA at the FIRST `]]>`, leaving a stray `]` that DW parses as garbage | Always end CDATA with EXACTLY `]]>` (two `]`, then `>`) |
+| `${env.<NAME>}` in `config.yaml` or XML expecting it to read an OS env var | Mule does NOT auto-resolve `${env.X}` to OS environment variables — deploy fails with `PropertyNotFoundException: ${env.X:}` | Inject the value as a JVM system property at startup (`-M-D<prop>=<value>`) and reference `${<prop>}` |
+
+When the agent extends this list (after debugging a new class of error with the user), it MUST add a row here AND a Decisions Log entry in `PROJECT_CONTEXT.md` so the lesson sticks.
+
+## Critical Gotchas — Never Violate
+
+- **`var input = payload`** in the DW header is INVALID — never assign `payload` to a variable in the header. Use it directly in the body.
+- **`error()` is NOT a standard DW function** — use Mule `<choice>` router + `<raise-error>` for validation logic, not DataWeave.
+- **No side-effects** — no `log()`, no I/O in production DWL. Keep transforms pure.
+- **`readUrl(url)` does NOT infer MIME type from the file extension.** With no second arg it defaults to `application/dw` and tries to PARSE the file as a DataWeave script — fails at runtime with `Exception while reading '...' as 'application/dw'` and a `WARN ... Using Weave Reader at Runtime ...` right above. ALWAYS pass the MIME type explicitly:
+  - CSV: `readUrl(url, "application/csv;charset=UTF-8", { header: true, separator: "," })`
+  - JSON: `readUrl(url, "application/json;charset=UTF-8")`
+  - XML:  `readUrl(url, "application/xml;charset=UTF-8")`
+  - Raw text: `readUrl(url, "text/plain;charset=UTF-8")`
+  - Reader properties go in the **third** argument, NOT chained as `as String { encoding: ... }` — that form silently does nothing because `as String` doesn't accept reader properties.
+- **`encoding` is NOT a CSV / JSON / XML READER property — it's a WRITER-only property.** This is the single most common DW error the agent has shipped. Symptom at runtime: `Option 'encoding' is not valid. Valid options are: streaming, separator, quote, escape, bodyStartLineNumber, ignoreEmptyLine, header, headerLineNumber` (CSV — JSON/XML report the analogous list). To specify input encoding, put it in the **MIME type's `charset` parameter** (e.g. `"application/csv;charset=UTF-8"`), NEVER in the third-arg reader properties object. Verified valid READER properties:
+  - **CSV**: `bodyStartLineNumber`, `escape`, `header`, `headerLineNumber`, `ignoreEmptyLine`, `quote`, `separator`, `streaming`
+  - **JSON**: `streaming` (only)
+  - **XML**: `externalEntities`, `indexedReader`, `nullValueOn`, `optimizeFor`, `streaming`, `supportDtd`
+  - **`text/plain`**: no reader properties at all — encoding goes in the MIME type charset
+  - When in doubt, `WebFetch` `https://docs.mulesoft.com/dataweave/latest/dataweave-formats-<format>` and copy the Reader-Properties table verbatim. Do NOT extrapolate "any text format probably accepts encoding" — that intuition is wrong for DW.
+- **NEVER hand-roll a CSV/JSON/XML parser in DW** (no manual `splitBy ","`, no manual header/cells `reduce`). DW's built-in readers handle quoting, escapes, encoding, and multi-line cells correctly. If you find yourself writing `splitBy ","` to parse a CSV, you're using `readUrl` wrong — fix the MIME type and the parsing collapses to one line.
+- **Object Store stores what you give it**:
+  - `<os:store>` after `output application/json` stores a **JSON string** (bad — `retrieve-all` returns escaped strings)
+  - Use `output application/java` BEFORE `<os:store>` so it stores a native Java Map
+  - Add a separate `<ee:transform output="application/json">` AFTER store for the HTTP response
+- **Object Store retrieve**:
+  - `<os:retrieve-all>` returns String values when the stored value was a String — defensively parse:
+    ```dw
+    if (item is String) read(item, "application/json") else item
+    ```
+  - `<os:retrieve>` returns the object directly — NO `read()` needed
+
+## Common Patterns
+
+```dw
+payload map ((item) -> { id: item.id, name: item.name })          // map
+payload filter ($.status == "active")                              // filter
+payload flatMap ((item) -> item.children)                          // flatMap
+payload groupBy $.category                                         // groupBy
+payload map ((item, idx) -> { index: idx, value: item })           // map with index
+if (payload.qty > 0) "in-stock" else "out-of-stock"               // conditional
+uuid()                                                             // generate UUID string
+now()                                                              // current DateTime
+now() as String { format: "yyyy-MM-dd'T'HH:mm:ss" }                // formatted timestamp
+sizeOf(payload)                                                    // array length
+```
+
+## Reading Variables, Vars, Attributes
+
+```dw
+vars.customerId                  // Mule variable
+attributes.queryParams.status    // HTTP query param
+attributes.headers.'X-Correlation-Id'  // HTTP header (quote when name has dashes)
+attributes.uriParams.id          // HTTP URI param (e.g. /customers/{id})
+```
+
+## Reference Docs — fetch on uncertainty
+
+If a function or behavior isn't covered above, the agent MUST `WebFetch` the relevant URL BEFORE generating code that uses it. **Don't guess from memory.** Memory-based DW is the single biggest source of the kind of mistakes this rule file documents.
+
+The agent should also `WebFetch` when the user asks about an unfamiliar DW function, when the linter complains about an unresolved reference (could be wrong namespace, not missing function), or when a transform involves I/O (`readUrl`, `read`, `write`) where MIME types and reader properties must be exact.
+
+| Topic | URL |
+|---|---|
+| DataWeave 2.0 functions index | https://docs.mulesoft.com/dataweave/latest/dw-functions |
+| `dw::Core` (`map`, `filter`, `reduce`, `default`, `sizeOf`, etc.) | https://docs.mulesoft.com/dataweave/latest/dw-core |
+| `readUrl` / `read` / `write` | https://docs.mulesoft.com/dataweave/latest/dw-core-functions-readurl |
+| Reader/writer properties (per format) | https://docs.mulesoft.com/dataweave/latest/dataweave-formats |
+| CSV reader options (`header`, `separator`, `quoteChar`, `escape`) | https://docs.mulesoft.com/dataweave/latest/dataweave-formats-csv |
+| JSON reader/writer options | https://docs.mulesoft.com/dataweave/latest/dataweave-formats-json |
+| XML reader/writer options | https://docs.mulesoft.com/dataweave/latest/dataweave-formats-xml |
+| Selectors (`.`, `[]`, `..`, `*`, `?`, slices) | https://docs.mulesoft.com/dataweave/latest/dataweave-selectors |
+| Strings module (`upper`, `replaceAll`, `substring`, ...) | https://docs.mulesoft.com/dataweave/latest/dw-strings |
+| Numbers module (`round`, `pow`, formatting) | https://docs.mulesoft.com/dataweave/latest/dw-numbers |
+| Arrays module (`drop`, `take`, `slice`, `partition`, ...) | https://docs.mulesoft.com/dataweave/latest/dw-arrays |
+| Objects module (`mergeWith`, `entriesOf`, `nameSet`, ...) | https://docs.mulesoft.com/dataweave/latest/dw-objects |
+| Date/time formatting | https://docs.mulesoft.com/dataweave/latest/dataweave-cookbook-dates |
+| Crypto module | https://docs.mulesoft.com/dataweave/latest/dw-crypto |
+| `dw::util::Coercions` (`toNumber`, `toBoolean`, ...) | https://docs.mulesoft.com/dataweave/latest/dw-util-coercions |
+| `do { ... }` block, `using`, `if/else`, pattern match | https://docs.mulesoft.com/dataweave/latest/dataweave-flow-control |
+| Type system (`as Number`, `as Date`, custom types) | https://docs.mulesoft.com/dataweave/latest/dataweave-types |
+
+### How to fetch efficiently
+
+- Don't `WebFetch` for things already covered by this rule file. The Common Patterns table, the Anti-Patterns table, and the Critical Gotchas list are authoritative — use them first.
+- Fetch the most specific URL you can (e.g. `dw-core-functions-readurl` not the general functions index) so the response stays small.
+- After fetching, summarize the relevant signature/example back to the user in 1-2 lines so they can verify your interpretation, then write the code.
+
+## Pre-Deploy Self-Check — MANDATORY before declaring DW changes done
+
+DW parse errors take ~90 seconds to surface through the `mvn package → copy to apps/ → runtime parses XML → runtime parses DW → fail` cycle. The agent MUST short-circuit this by doing the cheap checks first:
+
+1. **Re-read every `<![CDATA[%dw 2.0 ... ]]>` block you wrote/touched** and verify, in order:
+   - Header has exactly ONE `---`, with `output ...` (and any `var`/`fun`/`import`) above it.
+   - Every lambda parameter is a real identifier (no `_`, no `*`, no blank). Check `(...) ->` and `((...)) ->` patterns.
+   - Every `default` chain has the right operand types (no `default null` followed by `as Number`).
+   - CDATA closes with EXACTLY `]]>` — never `]]]>`. Count the `]` chars.
+   - No second `---` mid-script.
+   - Every `readUrl(...)` call has an EXPLICIT MIME type as its second argument (never default). For text-based formats, encoding goes in the **MIME type's `charset` parameter** (e.g. `"application/csv;charset=UTF-8"`), NOT in the third-arg reader properties object — `encoding` is a writer-only property and using it as a reader prop fails at runtime.
+   - Reader properties in the THIRD arg are limited to the per-format whitelists in the Critical Gotchas section (CSV: `header`, `separator`, `quote`, `escape`, `streaming`, etc.). If unsure, `WebFetch` `https://docs.mulesoft.com/dataweave/latest/dataweave-formats-<format>` and copy the table verbatim — never extrapolate.
+   - No hand-rolled parsers for CSV/JSON/XML — these always indicate `readUrl` is being called wrong.
+2. **Grep the edited XML files against the Forbidden Patterns blocklist** at the top of this rule. Concrete commands the agent should run (PowerShell):
+
+   ```powershell
+   # 2a. encoding as a CSV/JSON/XML reader prop (writer-only — runtime crash at first request)
+   Select-String -Path 'src/main/mule/*.xml' -Pattern 'encoding\s*:\s*"' -SimpleMatch:$false
+
+   # 2b. readUrl called with no MIME type (defaults to application/dw — runtime crash)
+   Select-String -Path 'src/main/mule/*.xml' -Pattern 'readUrl\s*\(\s*[^,]+\)'
+
+   # 2c. as String { encoding: ... } anti-pattern (silently ignored)
+   Select-String -Path 'src/main/mule/*.xml' -Pattern 'as\s+String\s*\{\s*encoding'
+
+   # 2d. CDATA close with stray ] (parses as DW garbage)
+   Select-String -Path 'src/main/mule/*.xml' -Pattern '\]\]\]\>'
+
+   # 2e. payload[0] on a Salesforce result (use payload.items[0])
+   Select-String -Path 'src/main/mule/*.xml' -Pattern 'payload\[0\]'
+
+   # 2f. ${env.X} in YAML/XML (Mule does NOT read OS env vars — use -M-D system properties)
+   Select-String -Path 'src/main/mule/*.xml','src/main/resources/*.yaml' -Pattern '\$\{env\.'
+   ```
+
+   Any non-empty result is a deploy-blocker — fix before continuing. Skip individual greps only when the change clearly cannot have introduced that pattern (e.g. no `readUrl` was added).
+
+3. **Run `ReadLints` on the edited XML files**. The ACB DW linter catches identifier issues, undefined references, and selector-on-null cases BEFORE deploy. Treat any `[ERROR]` in a DW block as a deploy-blocker — fix before suggesting the user run.
+4. **For non-trivial transforms** (more than ~10 lines, or anything iterating over external data, or anything calling `readUrl`/`read`/`write`), the agent SHOULD recommend the user paste the script into the **ACB DataWeave Playground** with a sample input first, then drop the verified script into the flow XML. This is faster than the deploy loop and catches **runtime-only** bugs that neither the linter nor the parser can detect — wrong MIME type, wrong reader properties, wrong key names, wrong nesting.
+
+Skipping these steps and letting the deploy fail is a workflow regression — the user already gave us linter access; we should use it.
+
+### Two distinct DW failure classes — the checks above target both
+
+| Class | When it surfaces | Caught by |
+|---|---|---|
+| **Parse error** (e.g. `_` as parameter name, missing `]]>`, second `---`) | At deploy/init — `Failed to deploy artifact: ... Invalid input ...` | `ReadLints` + step-1 visual checks |
+| **Runtime error** (e.g. `readUrl` wrong MIME, `payload[0]` instead of `payload.items[0]`, null selector on missing field) | When a request hits the flow — `MULE:EXPRESSION ... Exception while ...` | DW Playground + MUnit tests with realistic payloads |
+
+A successful deploy proves only the syntax is valid — it does NOT prove the script does the right thing. Always recommend the user smoke-test ALL endpoints touched by a DW change, not just one.
