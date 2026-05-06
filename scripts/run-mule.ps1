@@ -5,19 +5,50 @@
 .DESCRIPTION
   1. Loads .env into the current process
   2. Builds the app with Maven
-  3. Copies the packaged jar into the standalone runtime apps folder
+  3. Clears the standalone runtime apps/ folder (jars + exploded apps), then copies
+     this project's jar so only this workspace runs
   4. Sets MULE_OPTS with -D system properties for Salesforce credentials
   5. Starts the Mule runtime in console mode (Ctrl+C to stop)
 
   Auto-discovers the latest mule-enterprise-standalone-* under ~/AnypointCodeBuilder/runtime.
 
 .NOTES
-  Run via the Cursor task "Run Mule (Cursor)" or directly: pwsh ./scripts/run-mule.ps1
+  Run via the Cursor task "Mule: Run (Cursor)" (see .vscode/tasks.json) or: pwsh ./scripts/run-mule.ps1
 #>
 
 $ErrorActionPreference = 'Stop'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
+
+function Remove-PathRobust([Parameter(Mandatory)][string]$LiteralPath) {
+  if (-not (Test-Path -LiteralPath $LiteralPath)) { return }
+  $item = Get-Item -LiteralPath $LiteralPath -Force
+  $full = $item.FullName.TrimEnd('\')
+  if (-not $item.PSIsContainer) {
+    Remove-Item -LiteralPath $full -Force
+    return
+  }
+  if ($env:OS -notmatch 'Windows') {
+    Remove-Item -LiteralPath $full -Force -Recurse
+    return
+  }
+  # Windows: exploded Mule apps nest very deep; Remove-Item hits MAX_PATH and also chokes
+  # on 8.3 short paths (e.g. C:\Users\AD6F37~1.SHA when username has a dot). Strategy:
+  #  1) Use .NET GetTempPath() (canonical long form, never 8.3) for the empty stub.
+  #  2) robocopy /MIR an empty stub onto the target -> handles long paths internally.
+  #  3) Use cmd `rmdir /s /q` (rock-solid on Windows) to remove the now-empty top folder
+  #     and the stub, instead of PS Remove-Item -LiteralPath which is fragile here.
+  $stub = Join-Path ([System.IO.Path]::GetTempPath()) ('mule-clean-' + [guid]::NewGuid().ToString('N'))
+  [void](New-Item -ItemType Directory -Path $stub -Force)
+  try {
+    & robocopy $stub $full /MIR /R:3 /W:1 /NJH /NJS /NDL /NC /NS /NP /NFL | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed clearing '$full' (exit $LASTEXITCODE)" }
+    & cmd.exe /c "rmdir /s /q `"$full`"" | Out-Null
+  }
+  finally {
+    & cmd.exe /c "rmdir /s /q `"$stub`"" 2>$null | Out-Null
+  }
+}
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 
@@ -105,6 +136,18 @@ try {
   if (-not (Test-Path $appsDir)) {
     New-Item -ItemType Directory -Path $appsDir | Out-Null
   }
+
+  # Shared ACB runtime deploys everything under apps/: jars AND exploded app folders
+  # (same basename as the jar). Removing only *.jar leaves old exploded dirs, so Mule
+  # still starts multiple apps. Clear apps/ entirely, then copy only this project's jar.
+  $existing = @(Get-ChildItem -Path $appsDir -Force -ErrorAction SilentlyContinue)
+  if ($existing.Count -gt 0) {
+    Write-Step "Clearing $($existing.Count) item(s) from shared runtime apps/ (jars + exploded apps; single-workspace run)"
+    foreach ($entry in $existing) {
+      Remove-PathRobust -LiteralPath $entry.FullName
+    }
+  }
+
   $deployTarget = Join-Path $appsDir $jar.Name
   Write-Step "Copying jar to $deployTarget"
   Copy-Item $jar.FullName $deployTarget -Force

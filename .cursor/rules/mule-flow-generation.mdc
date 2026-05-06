@@ -14,6 +14,67 @@ The agent hand-writes Mule XML in this project (no MCP). Follow these patterns p
 - Sub-flows: `<feature>-<step>-sub-flow` (e.g. `orders-validate-sub-flow`)
 - Every processor MUST have `doc:name="<descriptive name>"`
 
+## Comments — Use `doc:name`, Not `<!-- -->` Inside `<flow>`
+
+The agent MUST NOT place `<!-- … -->` comments **inside** a `<flow>…</flow>` body, an `<error-handler>…</error-handler>` body, or a `<sub-flow>…</sub-flow>` body. Every step's purpose is conveyed via the `doc:name="…"` attribute on the processor itself — that's what ACB renders in the visual flow designer, what shows up in logs, and what MUnit references in failure output. An inline `<!-- ── Step N: do the thing ─── -->` above a processor that already has `doc:name="Do the thing"` is pure duplication and clutter.
+
+```xml
+<!-- WRONG — narrative comment duplicating doc:name -->
+<flow name="customers-create-flow">
+  <!-- ── Step 1: Read the bundled JSON file ─────────────── -->
+  <ee:transform doc:name="Read source customers">
+    ...
+  </ee:transform>
+
+  <!-- ── Step 2: Build the SF Account collection ─────────── -->
+  <ee:transform doc:name="Build SF Account collection">
+    ...
+  </ee:transform>
+</flow>
+```
+
+```xml
+<!-- RIGHT — same flow, no inline comments; doc:name carries the story -->
+<flow name="customers-create-flow">
+  <ee:transform doc:name="Read source customers">
+    ...
+  </ee:transform>
+
+  <ee:transform doc:name="Build SF Account collection">
+    ...
+  </ee:transform>
+</flow>
+```
+
+### Where comments ARE allowed
+
+- **File-level header above `<mule>` or directly under `<mule>` before the first `<flow>`** — design notes, ADR references, "this file owns endpoints X / Y / Z", or a short rationale for an unusual pattern. Keep these terse: 2–6 lines is plenty. If the rationale is long enough to need paragraphs, put it in `PROJECT_CONTEXT.md` § Decisions Log instead and reference the decision date here.
+- **Inside DataWeave bodies** — DW has its own comment syntax (`// line`, `/* block */`); use those when a transform really needs explaining. They sit inside the `<![CDATA[…]]>` and never duplicate `doc:name`.
+- **Inside a configuration element** that explains a non-obvious attribute choice (rare). Example: explaining why a particular `pollingFrequency` was picked.
+
+### Why this rule exists
+
+1. **`doc:name` is the only label that survives** — it's what ACB's visual designer shows, what Mule writes to logs (`flow:CustomersCreate.transform("Build SF Account collection")`), and what MUnit references in test failure output. Inline `<!-- -->` comments are invisible everywhere except the raw XML.
+2. **Comment drift** — narrative comments rot the moment a flow is reordered, a processor is renamed, or a step is removed. `doc:name` rots too if you don't update it, but at least the rot is visible in the visual designer and in logs.
+3. **Reading time** — a clean `<flow>` body with descriptive `doc:name` attributes reads like a numbered table of contents. The same flow with bracketed step comments reads like a stream-of-consciousness essay. The agent is supposed to be writing maintainable XML, not annotating its own thought process.
+
+### How to convey "intent" without an inline comment
+
+- **Step purpose** → put it in `doc:name="Pre-compute upsert failure flag and error details"` (verb + object, ~5–8 words)
+- **Why this step exists at all** → either it's obvious from `doc:name`, or it's an architectural decision that belongs in `PROJECT_CONTEXT.md` § Decisions Log, NOT in flow XML
+- **A non-obvious DW expression inside an `<ee:transform>`** → use a DW comment INSIDE the `<![CDATA[…]]>` block: `// reduce with initial {} handles empty payload`
+- **A workaround for a known runtime bug** → file-level header comment with a one-line link/reference (e.g. "Lambdas pre-computed in <ee:transform> to avoid Mule 4.11 AlertingSupport NPE — see mule-flow-generation.mdc § Choice Predicates"). Keep it at the top of the file, not buried mid-flow.
+
+### Pre-deploy grep — add to your check list
+
+```powershell
+# Detects an inline <!-- ... --> comment that lives inside a <flow>, <sub-flow>,
+# or <error-handler> body (multiline mode required because comments span lines).
+Select-String -Path 'src/main/mule/*.xml' -Pattern '(?s)<(?:flow|sub-flow|error-handler)\b[^>]*>.*?<!--.*?-->.*?</(?:flow|sub-flow|error-handler)>'
+```
+
+Any non-empty result means an inline comment slipped past — strip it before declaring the work done.
+
 ## Required XML Root
 
 Every flow file MUST declare `xmlns:doc` — missing it causes the build to fail with `The prefix "doc" for attribute "doc:name" is not bound`.
@@ -166,6 +227,94 @@ If you find yourself writing `"Unexpected … : " ++ write(payload, "application
 - External `.dwl` in `src/main/resources/dwl/` for anything larger; reference via `<ee:set-payload resource="dwl/customer-mapping.dwl"/>`
 - See `mule-dataweave.mdc` for full DWL rules
 
+## Choice Predicates — Keep Them Trivial (Mule 4.11.x AlertingSupport NPE)
+
+Mule 4.11.x has a runtime defect where a `<choice>`/`<when>` expression that performs non-trivial DataWeave evaluation can throw:
+
+```
+NullPointerException: Cannot invoke "org.mule.runtime.api.alert.AlertingSupport.triggerAlert(String, Object)"
+because the return value of "java.util.Map.get(Object)" is null
+```
+
+surfaced as error type `MULE:UNKNOWN`. The runtime tries to fire an internal alert during expression evaluation but the alerts map for that scope isn't populated, so the NPE *masks* the real underlying issue and the error bubbles up to your `ANY` handler as a generic 500 `INTERNAL_ERROR`. Worse: anything the flow already DML'd before the failing `<choice>` (Account upsert, DB insert, ObjectStore write) **stays committed** — Mule does not auto-rollback — so you end up with partial state in the downstream system and no clear error message about what went wrong.
+
+This bug is hard to debug because the failure point in the stack trace is the `<choice>` itself, not the line of DataWeave that broke. The rule below avoids the bug entirely AND makes future debugging easier.
+
+### Forbidden — complex predicate inside `<when>`
+
+Anything in this list inside a `<when expression="#[...]">` is a deploy-blocker:
+
+- Lambda parameters: `((x) -> ...)` or `((x, i) -> ...)`
+- Higher-order ops: `map`, `filter`, `some`, `every`, `find`, `flatMap`, `reduce`, `groupBy`, `joinBy`
+- String functions: `upper`, `lower`, `trim`, `replace`, `substring`, `match`
+- Type coercion: `as String`, `as Number`, `as Boolean`, `as Object`, `as Date`
+- Null-safe chains beyond a single `default`: `(x.y default {}).z default ""`
+- Block expressions: `do { ... }`
+- Module function calls: `dw::core::strings::*`, `dw::Crypto::*`, etc.
+
+```xml
+<!-- WRONG — complex lambda inside <when>, triggers Mule 4.11 AlertingSupport NPE -->
+<choice doc:name="Has any buyer">
+  <when expression="#[vars.originalAccounts some ((r) -> (r.IsBuyer == true) or (upper((r.IsBuyer as String default '')) == 'TRUE'))]">
+    ...
+  </when>
+</choice>
+```
+
+### Required — pre-compute in `<ee:transform>`, predicate is just `sizeOf`/comparison
+
+Push the work into a preceding `<ee:transform>` that lands the answer in a `vars.*` variable. The `<choice>` predicate then becomes trivial.
+
+```xml
+<ee:transform doc:name="Pre-compute buyer rows">
+  <ee:variables>
+    <ee:set-variable variableName="buyerRows"><![CDATA[%dw 2.0
+output application/java
+---
+vars.originalAccounts filter ((r) ->
+  (r.IsBuyer == true) or (upper(((r.IsBuyer default "") as String)) == "TRUE")
+)]]></ee:set-variable>
+  </ee:variables>
+</ee:transform>
+
+<choice doc:name="Has any buyer">
+  <when expression="#[sizeOf(vars.buyerRows default []) > 0]">
+    ...
+  </when>
+  <otherwise>...</otherwise>
+</choice>
+```
+
+### The whitelist — what `<when>` expressions ARE allowed
+
+`<when expression="#[...]">` may ONLY contain:
+
+- `sizeOf(vars.X default [])` style length checks
+- Boolean combinators: `and`, `or`, `not`
+- Comparisons: `==`, `!=`, `>`, `<`, `>=`, `<=`
+- Direct variable / payload / attribute access: `vars.X`, `payload.field`, `attributes.headers.Foo`
+- A single literal `default` to handle null: `vars.X default 0`
+- Built-in single-value introspection used as filters: `payload is Array`, `payload is Object`, `payload is String`
+
+Anything outside this whitelist → move it to an `<ee:transform>` first. No exceptions, even if the expression "looks simple" to a human — the bug fires on shape, not complexity score.
+
+### Why this rule also improves debuggability
+
+| If the bug is in… | …error type the handler sees | …and the location | Notes |
+|---|---|---|---|
+| `<when expression="#[<complex>]">` (forbidden) | `MULE:UNKNOWN` (NPE) | The `<choice>` element — opaque | Real cause is masked; can leave partial Salesforce/DB state |
+| `<ee:transform>` (required) | `MULE:EXPRESSION` (clean DW error with line/column) | The transform — pinpoints the broken expression | Catchable as a real error type; map to 400 `BAD_INPUT` |
+
+### Pre-deploy grep — add to your check list
+
+```powershell
+# Detects lambda parameters or higher-order ops inside a <when expression="#[...]">
+Select-String -Path 'src/main/mule/*.xml' `
+  -Pattern '<when\s+expression="#\[[^"]*(\)\s*->|\bsome\b|\bevery\b|\bmap\s*\(|\bfilter\s*\(|\bupper\s*\(|\blower\s*\(|\sas\s+(String|Number|Boolean|Object|Date))'
+```
+
+Any match is a deploy-blocker. Refactor the predicate into a preceding `<ee:transform>` before continuing.
+
 ## Common Gotchas
 
 - **CDATA — only one valid close sequence** — In XML, a CDATA section **must** end with exactly **`]]>`** (two `]` characters, then `>`). Nothing else may appear between your DataWeave text and that terminator except the characters that are **part of the expression**.
@@ -194,13 +343,25 @@ If you find yourself writing `"Unexpected … : " ++ write(payload, "application
 
   Here **`}]]>`** means: `}` ends the DataWeave object, then **`]]>`** closes CDATA — exactly **two** `]` characters before `>`. **Never** use **`}]]]>`** (that inserts an extra `]` and can reproduce the same deploy error).
 
-- **Prefer skipping CDATA for constant strings in `ee:set-variable`** — avoids `]]>` typos entirely:
+- **NEVER put `value="..."` on `<ee:set-variable>` (EE core)** — The Mule Maven plugin validates flow XML against the EE schema. **`value` is not a valid attribute** on `<ee:set-variable>`. You get:
+
+  `cvc-complex-type.3.2.2: Attribute 'value' is not allowed to appear in element 'ee:set-variable'.`
+
+  Put literals and expressions in the **element body** instead:
 
 ```xml
-<ee:set-variable variableName="errorCode" value='#["INTERNAL_ERROR"]' doc:name="errorCode"/>
+<ee:set-variable variableName="httpStatus" doc:name="httpStatus">503</ee:set-variable>
+<ee:set-variable variableName="errorCode" doc:name="errorCode">#["INTERNAL_ERROR"]</ee:set-variable>
+<ee:set-variable variableName="errorMessage" doc:name="errorMessage">#[error.description]</ee:set-variable>
 ```
 
-  Or use a single-line expression attribute `value="#[&quot;INTERNAL_ERROR&quot;]"` / `value='#["INTERNAL_ERROR"]'` per your quoting rules.
+  (Core Mule `<set-variable>` may allow `value=` in other contexts; this project uses **`xmlns:ee`** transforms — follow body content only.)
+
+- **Prefer skipping CDATA for short constants** — avoids `]]>` typos; still use **body**, not `value=`:
+
+```xml
+<ee:set-variable variableName="errorCode" doc:name="errorCode">#["INTERNAL_ERROR"]</ee:set-variable>
+```
 
 - **HTTP listener bodies** — If you wrap `#[output ... --- { ... }]` in CDATA, the sequence after the closing `}` is **`]]>`** only, e.g. `... }]]>` inside `<![CDATA[ ... ]]>` (see `}]]>` above — still only two `]` before `>`).
 - `var input = payload` is INVALID in DW header — never assign `payload` to a variable
@@ -229,9 +390,18 @@ The agent MUST NOT report a flow change as "done" or recommend the user run / sm
 
 4. **Update fixtures if surface changed** — if the change added/removed an endpoint, changed a field name, changed a status code, or changed an error code, the agent MUST update `scripts/smoke-test.ps1` in the SAME response so the new gate is meaningful. A green smoke test on stale assertions is worse than a red one.
 
+### Why smoke might still miss a bug (agent MUST avoid this)
+
+1. **Smoke was never run** after the change — the Self-Test Gate requires running `scripts/smoke-test.ps1` and reporting exit code; skipping this is a regression.
+2. **Stale deployment** — the user (or agent) ran smoke against an **old** jar still in the runtime `apps/` folder while the IDE has newer XML. Always rebuild (`mvn package`) and redeploy / restart so the running app matches the branch.
+3. **Wrong gate** — `mvn package` alone does **not** execute `readUrl`, `<choice>` expressions, or connector calls; it only validates XML schema and packaging. Runtime-only failures require step 3 (smoke) or manual `Invoke-RestMethod`.
+
+Before marking DW + HTTP work done, the agent SHOULD **`grep` `src/main/mule` for `readUrl` / `resource://`** and fix any `resource://` per `mule-dataweave.mdc`.
+
 ### What the smoke test catches that the linter cannot
 
 - `readUrl` MIME-type bugs (parsed fine, fails at runtime — see `mule-dataweave.mdc`)
+- **`readUrl` URL scheme bugs** (e.g. `resource://` instead of `classpath://`) — XML/DW still **parses and packages**; only a **live HTTP hit** after deploy fails. Maven does not evaluate DataWeave.
 - Wrong status codes (200 returned where 404 expected, etc.)
 - Wrong error envelope shape (`code` field missing, `message` empty)
 - Wrong field names in the response (e.g. `Price` vs `price`)
@@ -241,10 +411,21 @@ The agent MUST NOT report a flow change as "done" or recommend the user run / sm
 
 The lint gate catches **parse-time** bugs. The smoke gate catches **runtime** bugs. Both classes are in scope; both gates are required.
 
+### Scheduled jobs (`JOBS.md` + `mule-scheduler-jobs.mdc`)
+
+HTTP smoke tests cannot trigger `<scheduler>`. When adding or changing **scheduled** flows:
+
+1. Document the job in **`JOBS.md`** (not `API.md`) — see **`mule-scheduler-jobs.mdc`**.
+2. Implement **business logic in a `<sub-flow>`** and expose a **manual `<http:listener>`** flow that **`flow-ref`s the same sub-flow** for local verification.
+3. Add **one smoke-test case per manual-trigger path** (method, path, expected status + minimal JSON shape) — documented in `JOBS.md` § Manual test hook.
+4. The agent **MUST** run `scripts/smoke-test.ps1` after editing smoke cases and report exit code.
+
+Do **not** require API-style `vars.httpStatus` mapping for scheduler flows; the manual HTTP trigger may still return a simple 200 JSON envelope for smoke assertions.
+
 ### When the gate is allowed to be skipped
 
 Only when:
-- The change is purely documentation (`API.md`, `PROJECT_CONTEXT.md`, `*.mdc` rule files, README).
+- The change is purely documentation (`API.md`, `JOBS.md`, `PROJECT_CONTEXT.md`, `*.mdc` rule files, README).
 - The change is purely to a `.dwl` test-fixture file under `src/test/resources/` that no flow loads.
 - The change is to `pom.xml` or `mule-artifact.json` AND no XML/DW was touched (in which case run `mvn validate` instead).
 

@@ -9,14 +9,32 @@ This is a MuleSoft 4 project developed in **Anypoint Code Builder (ACB)** — th
 
 Deployment (CloudHub, RTF, on-prem) is handled **manually by the developer** — do not generate or run deploy commands.
 
-## Source of Truth — Two Living Files
+## Mandatory development phases (single source — follow every time)
+
+Use this checklist for **every** delivery that adds or edits **`src/main/mule/**/*.xml`** or DataWeave those flows execute. **Do not** scatter a separate phase list across other `.md` or `.mdc` files — **this section is the only canonical gate.**
+
+**Visibility:** Paste the numbered steps below into the chat at the start of the work and tick them off as you complete them. **Do not** mark the task **done** until every applicable step is complete.
+
+1. **Scope** — State what flows, endpoints, or integrations change (one or two sentences).
+2. **Implement** — Flow XML and shared configs (`global-configs.xml`); follow `mule-flow-generation.mdc`, `mule-dataweave.mdc`, connector rules (`mule-salesforce.mdc`, etc.).
+3. **MUnit (mandatory — never skip)** — In the **same response** as the flow change: add or update **`src/test/munit/<flow-file-base>-test-suite.xml`** for **each** touched flow file. Minimum per flow: **happy path** + **one failure path**; **mock every external connector** the flow calls. How-to: **`mule-testing-munit.mdc`**. Run **`mvn test`** when Maven is available and **report the exit code**; if `mvn test` cannot run (no Exchange creds, etc.), you must still ship the suite and tell the user to run **Run MUnit Tests** in ACB. **If `src/main/mule/` changed and there is no MUnit update, the delivery is incomplete.**
+4. **Lint** — Run **`ReadLints`** on every edited XML/DW file; fix every **`[ERROR]`** (warnings may stay if pre-existing).
+5. **Smoke** — When local Mule is up: run **`scripts/smoke-test.ps1`** (task **Mule: Smoke test**) and **report exit code**; if `API.md` contract changed, update the script in the **same** delivery.
+6. **Docs** — When HTTP behaviour changes: **`API.md`** + **`PROJECT_CONTEXT.md`** (API inventory). Scheduler jobs: **`JOBS.md`** (not `API.md`). See **`mule-api-docs.mdc`** / **`mule-init-context.mdc`**.
+
+**When steps 3–6 are waived** — Only if the change is **purely** documentation, **purely** Cursor rules with **no** Mule XML/DW, **`pom.xml` / `mule-artifact.json` only** with **no** flow XML touched, or a test fixture under `src/test/resources/` that **no** flow loads. **Anything under `src/main/mule/` requires steps 2–6, including MUnit.**
+
+**Deeper detail** — `mule-flow-generation.mdc` (Self-Test Gate, choice predicates, error handlers), `mule-testing-munit.mdc` (mock shapes, assertions), and `mule-dataweave.mdc` explain *how*; **this section defines *whether* the work is allowed to ship.**
+
+## Source of Truth — Living Documentation Files
 
 | File | Purpose |
 |---|---|
 | `PROJECT_CONTEXT.md` | Project state — runtime, inventories, env vars, decisions log |
-| `API.md` | Human-readable API reference — every endpoint with demo request/response |
+| `API.md` | Human-readable **REST (or SOAP) API** reference — every HTTP endpoint with demo request/response |
+| **`JOBS.md`** | Human-readable **scheduled job** reference — schedule (from `config.yaml`), sources, destinations, business logic, manual trigger path (see `mule-scheduler-jobs.mdc`) |
 
-**Before any code work**: read `PROJECT_CONTEXT.md` first. If it doesn't exist, or the answer to a question isn't in it, follow `mule-init-context.mdc` (init workflow + Never-Guess Policy). When endpoints change, update `API.md` in the SAME response per `mule-api-docs.mdc`.
+**Before any code work**: read `PROJECT_CONTEXT.md` first. If it doesn't exist, or the answer to a question isn't in it, follow `mule-init-context.mdc` (init workflow + Never-Guess Policy). When **HTTP endpoints** change, update `API.md` in the SAME response per `mule-api-docs.mdc`. When **scheduler-triggered jobs** change, update **`JOBS.md`** instead — **do not** add those jobs to `API.md`.
 
 ## Rule Index
 
@@ -30,7 +48,8 @@ Deployment (CloudHub, RTF, on-prem) is handled **manually by the developer** —
 | DataWeave 2.0 transforms | `mule-dataweave.mdc` |
 | MUnit tests | `mule-testing-munit.mdc` |
 | Database connector (any JDBC DB) | `mule-database.mdc` |
-| Salesforce connector | `mule-salesforce.mdc` |
+| Salesforce connector | `mule-salesforce.mdc` (incl. **200-row DML chunking**, **batching vs per-row `foreach`**) |
+| **Scheduled jobs / `<scheduler>`** | **`mule-scheduler-jobs.mdc`** (`JOBS.md`, watermarking, DLQ-style errors, manual HTTP trigger) |
 
 ## Project-Wide Standards
 
@@ -84,8 +103,8 @@ When the project is opened in Cursor (or any non-VS-Code editor), the agent MUST
    - Loads `.env` into the process
    - Builds the app with `mvn clean package -DskipTests`
    - Copies the packaged jar to the standalone runtime `apps/` folder
-   - Sets `MULE_OPTS="-Dsfdc.username=… -Dsfdc.password=… -Dsfdc.token=…"`
-   - Runs `mule.bat console` so logs stream in the task panel
+   - Passes Salesforce credentials as **`mule.bat console -M-Dsfdc.username=… -M-Dsfdc.password=… -M-Dsfdc.token=…`** (do **not** use `MULE_OPTS` — `mule.bat` overwrites it)
+   - Streams logs in the task panel until you stop the process
 3. **Stop**: run task **`Mule: Stop`** (or `Ctrl+C` in the task panel)
 4. **Tail log separately**: run task **`Mule: Tail log`** (auto-discovers the latest runtime under `~/AnypointCodeBuilder/runtime`)
 5. Wait for `DEPLOYED` (~60–90s) before hitting endpoints

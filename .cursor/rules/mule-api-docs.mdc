@@ -5,9 +5,11 @@ alwaysApply: true
 
 # API Documentation File (`API.md`)
 
-Every Mule project MUST maintain an `API.md` at the project root. It is the **human-readable companion** to the RAML/OAS spec — the page a new developer, QA, or integration partner opens FIRST to understand "what does this API do, and how do I call it?"
+Every Mule project MUST maintain an `API.md` at the project root **when the project exposes synchronous HTTP APIs**. It is the **human-readable companion** to the RAML/OAS spec — the page a new developer, QA, or integration partner opens FIRST to understand "what does this API do, and how do I call it?"
 
 The RAML/OAS file is for machines. `API.md` is for humans.
+
+**Scheduled integrations** (flows triggered by `<scheduler>`) are **not** documented in `API.md`. Use **`JOBS.md`** at the project root per **`mule-scheduler-jobs.mdc`**.
 
 ---
 

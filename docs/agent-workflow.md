@@ -2,6 +2,8 @@
 
 This project is a **MuleSoft 4 + Anypoint Code Builder** codebase, but it is also an **AI-assisted** codebase. The Cursor agent that helps you edit it is configured by a stack of rule files under `.cursor/rules/`. Those rules turn a generic LLM into a Mule-specialist that hand-writes XML, DataWeave, MUnit, and PowerShell with the same conventions every time.
 
+New to this repo in **Cursor**? Read [**`GETTING_STARTED.md`**](./GETTING_STARTED.md) first (marketplace, extensions, tasks, scripts, manual CloudHub).
+
 This doc explains:
 
 1. The two-file source of truth the agent reads first
@@ -108,7 +110,7 @@ Plus coordinated XML and YAML changes:
 - **`config.yaml`** holds **only non-secret defaults** (URLs, hosts, ports, basePath); never credential entries
 - **Launch args mapping**: every secret in `.env` has a matching `-M-D…=${env:…}` line in **both** launch configs
 
-> **Why this matters**: Mule 4's `<configuration-properties>` resolver does **NOT** auto-translate `${env.SFDC_USERNAME}` into "read OS env var SFDC_USERNAME". It treats `env.SFDC_USERNAME` as a literal property name. If no such property is loaded, deploy fails with `PropertyNotFoundException: Couldn't find configuration property value for key ${env.SFDC_USERNAME:}`. The trailing `:` in that error is Mule's default-value separator — confirms it's a placeholder-resolution failure, not a connection issue. The fix is always to inject the value as a JVM system property at startup (`-M-D<prop>=<value>`) and reference `${<prop>}`. That's what `scripts/run-mule.ps1` does — see [`scripts/run-mule.md`](./scripts/run-mule.md).
+> **Why this matters**: Mule 4's `<configuration-properties>` resolver does **NOT** auto-translate `${env.SFDC_USERNAME}` into "read OS env var SFDC_USERNAME". It treats `env.SFDC_USERNAME` as a literal property name. If no such property is loaded, deploy fails with `PropertyNotFoundException: Couldn't find configuration property value for key ${env.SFDC_USERNAME:}`. The trailing `:` in that error is Mule's default-value separator — confirms it's a placeholder-resolution failure, not a connection issue. The fix is always to inject the value as a JVM system property at startup (`-M-D<prop>=<value>`) and reference `${<prop>}`. That's what `scripts/run-mule.ps1` does — see [`GETTING_STARTED.md` § 5](./GETTING_STARTED.md#5-how-the-helper-scripts-work-and-how-to-change-them).
 
 ### Mule Standalone Runtime gotcha — `MULE_OPTS` is overwritten
 
@@ -169,7 +171,7 @@ When a development task is complete (feature shipped, code generated, tests writ
   (and any other secrets added this session)
 - [ ] Confirm `.env` is gitignored (run: `git check-ignore .env` — should print `.env`)
 - [ ] In Anypoint Code Builder: open `global-configs.xml` → click each connector config → Test Connection
-- [ ] Run task **Mule: Run (Cursor)** (or hit F5 if you're in VS Code + ACB)
+- [ ] Run task **Mule: Run (Cursor)** in Cursor (**Ctrl+Shift+B** / Tasks). In **VS Code + ACB** only, F5 with a `type: mule` launch config is an alternative.
 - [ ] Wait for `DEPLOYED` in the log (~60–90s)
 - [ ] Smoke-test endpoints with `Invoke-RestMethod` (commands inline below)
 
@@ -192,7 +194,7 @@ The **same project** runs differently depending on which editor you opened it in
 
 When the project is opened in Cursor, the agent always directs you to the task — never tells you to "press F5" or "use ACB Run" without first confirming which IDE you're in.
 
-This is also why the helper script (`run-mule.ps1`) exists at all: it replicates ACB's launch behavior using only PowerShell + `mule.bat`, so Cursor users aren't second-class citizens. See [`scripts/run-mule.md`](./scripts/run-mule.md) for the full breakdown.
+This is also why the helper script (`run-mule.ps1`) exists at all: it replicates ACB's launch behavior using only PowerShell + `mule.bat`, so Cursor users aren't second-class citizens. See [`GETTING_STARTED.md`](./GETTING_STARTED.md) for prerequisites, tasks, and script behavior.
 
 ---
 

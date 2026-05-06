@@ -101,6 +101,7 @@ The model (and devs coming from JS/Scala/Python) constantly leaks foreign idioms
 | Java `null != x` | `x != null` (or `x?` selector for null-safe nav) |
 | Java `try { ... } catch ...` | DW has no try/catch — push validation into Mule `<choice>` + `<raise-error>` |
 | Kotlin `it` inside lambda | `$` (only in single-arg shorthand) |
+| **SQL/OO intuition:** `x as String { default: "" }` (or `as Number { default: 0 }`) | The `{ ... }` immediately after **`as <Type>`** allows **only** format/metadata keys for that coercion (e.g. `as String { format: "yyyy-MM-dd" }`), **not** `default`. The parser fails with `Invalid input 'd', expected '}'` (the **`d`** starts **`default`**). Use **`(x default "") as String`** or **`(x default 0) as Number`**. See Forbidden Patterns row **`as <Type> { default:`**. |
 
 ## Slicing & Skipping — One Idiom Per Job
 
@@ -127,6 +128,7 @@ Before writing any `<![CDATA[%dw 2.0 ...]]>` block, the agent MUST mentally grep
 | `encoding: "UTF-8"` (or `encoding:"UTF-8"`) inside a `readUrl(...)` / `read(...)` reader-properties object | `encoding` is a WRITER-only property for CSV/JSON/XML/text. Runtime fails: `Option 'encoding' is not valid. Valid options are: streaming, separator, quote, escape, bodyStartLineNumber, ignoreEmptyLine, header, headerLineNumber` | Move encoding to the MIME type: `"application/csv;charset=UTF-8"` and drop `encoding` from the third arg |
 | `as String { encoding:` | `as String` does NOT accept reader properties — the block is silently ignored, then `readUrl` falls back to `application/dw` and the file is parsed as a DW script | Use `readUrl(url, "<mime>;charset=UTF-8", { ... })` with the right MIME type |
 | `readUrl(<url>)` with NO second arg | Defaults to `application/dw`; tries to parse the file as a DataWeave script. Runtime fails: `Exception while reading '...' as 'application/dw'` | Always pass an explicit MIME type as the second arg |
+| **`resource://`** (or any unsupported scheme) in `readUrl` for bundled files | Mule rejects it at runtime: `Invalid url 'resource://...'` — **`resource://` is not a valid `readUrl` protocol** in DataWeave | Use **`classpath://`** for files under `src/main/resources`, e.g. `readUrl("classpath://data/accounts.json", "application/json;charset=UTF-8")`. Official docs: [readUrl](https://docs.mulesoft.com/dataweave/2.4/dw-core-functions-readurl) (`classpath://myfolder/myFile.txt`) |
 | `var input = payload` in the header | `payload` cannot be aliased in the header — parser rejects | Reference `payload` directly in the body |
 | `error(...)` as a DW function | Not a real DW function | Use Mule `<choice>` + `<raise-error>` instead |
 | `splitBy ","` to parse a CSV manually | Fragile — breaks on quoted commas, escapes, multi-line cells. Almost always means `readUrl` was called wrong (no MIME type) | Fix the `readUrl` MIME type; drop the manual parser |
@@ -134,6 +136,10 @@ Before writing any `<![CDATA[%dw 2.0 ...]]>` block, the agent MUST mentally grep
 | `(_, idx) ->` or `(*, idx) ->` lambda parameters | `_` / `*` are not valid DW identifiers — parser fails with `Invalid input '_'` | Give every param a real name, or use a slice: `arr[1 to -1]` |
 | `]]]>` at the end of a CDATA block | XML closes CDATA at the FIRST `]]>`, leaving a stray `]` that DW parses as garbage | Always end CDATA with EXACTLY `]]>` (two `]`, then `>`) |
 | `${env.<NAME>}` in `config.yaml` or XML expecting it to read an OS env var | Mule does NOT auto-resolve `${env.X}` to OS environment variables — deploy fails with `PropertyNotFoundException: ${env.X:}` | Inject the value as a JVM system property at startup (`-M-D<prop>=<value>`) and reference `${<prop>}` |
+| Lambda / higher-order op inside a `<when expression="#[...]">` (e.g. `some ((r) -> ...)`, `map ((x) -> ...)`, `upper(...)`, `as String`) | Mule 4.11.x runtime bug — evaluator throws `NullPointerException: Cannot invoke "AlertingSupport.triggerAlert" because Map.get is null` of type `MULE:UNKNOWN`. Masks the real error AND leaves any earlier DML committed (no rollback). | Pre-compute the answer in an `<ee:transform>` into `vars.X`; the `<when>` becomes `#[sizeOf(vars.X default []) > 0]` or a simple comparison. See `mule-flow-generation.mdc` § Choice Predicates — Keep Them Trivial for the full whitelist of allowed `<when>` expressions. |
+| **`as String { default:`** or more generally **`as <Type> { default:`** (e.g. `k as String { default: "" }`) | The `{ }` block after **`as <Type>`** is **not** a general “options object”. Only **documented format/writer (and some reader) keys** for that coercion are valid. **`default` is not allowed there** — deploy/init fails while parsing metadata: `Invalid input 'd', expected '}'` (column points at **`default`**). This rule file already forbids `as String { encoding:` for a different reason; **`default` in the same position fails earlier at parse time. | Put defaults on the **value**, then cast: **`(k default "") as String`**, **`(n default 0) as Number`**. Never **`k as String { default: "" }`**. |
+| `write(payload, 'application/json')` (or any `write(...)` that returns JSON/XML/CSV) inside a one-line `#[...]` expression that **also** concatenates Strings (e.g. `'msg=' ++ write(payload, 'application/json')`) | Mule cannot infer a single output media type when the expression mixes **`application/json`** (from `write`) with **`application/java`** (the String concat). Runtime fails with: **`Unable to infer a output media type as more than one is being used: application/json,application/java`** | Prefix the inline expression with an explicit DW header: **`#[%dw 2.0 output application/java --- 'msg=' ++ write(payload, 'application/json')]`**. Or precompute the message in an `<ee:transform>` (`output application/java`) into a variable and log `#[vars.summaryMessage]`. |
+| `Strings::replace(s, "x", "y")` (3 args) — assuming JS/Java-style substring replacement | In this DW version, `dw::core::Strings::replace` accepts **2 args** only (`arg0, arg1`). Calling with 3 args fails: **`Too many arguments (3) for function with parameters (arg0, arg1)`** | For a literal substring replace use **`(s splitBy "x") joinBy "y"`** (escapes `"x"` to `"y"` everywhere). For SOQL single-quote escaping specifically: **`(s splitBy "'") joinBy "''"`**. |
 
 When the agent extends this list (after debugging a new class of error with the user), it MUST add a row here AND a Decisions Log entry in `PROJECT_CONTEXT.md` so the lesson sticks.
 
@@ -142,12 +148,14 @@ When the agent extends this list (after debugging a new class of error with the 
 - **`var input = payload`** in the DW header is INVALID — never assign `payload` to a variable in the header. Use it directly in the body.
 - **`error()` is NOT a standard DW function** — use Mule `<choice>` router + `<raise-error>` for validation logic, not DataWeave.
 - **No side-effects** — no `log()`, no I/O in production DWL. Keep transforms pure.
+- **Classpath files — use `classpath://`, never `resource://`.** For files packaged from `src/main/resources`, `readUrl` only accepts the **`classpath:`** URL scheme (see [readUrl](https://docs.mulesoft.com/dataweave/2.4/dw-core-functions-readurl)). **`resource://` is invalid** and fails at the first request with `Invalid url`. This is **not** caught by `mvn package`. Use e.g. `readUrl("classpath://data/demo_accounts.json", "application/json;charset=UTF-8")`.
 - **`readUrl(url)` does NOT infer MIME type from the file extension.** With no second arg it defaults to `application/dw` and tries to PARSE the file as a DataWeave script — fails at runtime with `Exception while reading '...' as 'application/dw'` and a `WARN ... Using Weave Reader at Runtime ...` right above. ALWAYS pass the MIME type explicitly:
   - CSV: `readUrl(url, "application/csv;charset=UTF-8", { header: true, separator: "," })`
   - JSON: `readUrl(url, "application/json;charset=UTF-8")`
   - XML:  `readUrl(url, "application/xml;charset=UTF-8")`
   - Raw text: `readUrl(url, "text/plain;charset=UTF-8")`
   - Reader properties go in the **third** argument, NOT chained as `as String { encoding: ... }` — that form silently does nothing because `as String` doesn't accept reader properties.
+- **`as <Type> { default: ... }` is INVALID.** The `{ ... }` after a type coercion is **only** for allowed format/metadata keys for that type (e.g. date/number/string format). **`default` is not one of them.** Use **`(expression default fallback) as Type`** instead. Symptom at deploy: `Invalid input 'd', expected '}'` (parser is rejecting **`default`** as metadata).
 - **`encoding` is NOT a CSV / JSON / XML READER property — it's a WRITER-only property.** This is the single most common DW error the agent has shipped. Symptom at runtime: `Option 'encoding' is not valid. Valid options are: streaming, separator, quote, escape, bodyStartLineNumber, ignoreEmptyLine, header, headerLineNumber` (CSV — JSON/XML report the analogous list). To specify input encoding, put it in the **MIME type's `charset` parameter** (e.g. `"application/csv;charset=UTF-8"`), NEVER in the third-arg reader properties object. Verified valid READER properties:
   - **CSV**: `bodyStartLineNumber`, `escape`, `header`, `headerLineNumber`, `ignoreEmptyLine`, `quote`, `separator`, `streaming`
   - **JSON**: `streaming` (only)
@@ -234,6 +242,7 @@ DW parse errors take ~90 seconds to surface through the `mvn package → copy to
    - No second `---` mid-script.
    - Every `readUrl(...)` call has an EXPLICIT MIME type as its second argument (never default). For text-based formats, encoding goes in the **MIME type's `charset` parameter** (e.g. `"application/csv;charset=UTF-8"`), NOT in the third-arg reader properties object — `encoding` is a writer-only property and using it as a reader prop fails at runtime.
    - Reader properties in the THIRD arg are limited to the per-format whitelists in the Critical Gotchas section (CSV: `header`, `separator`, `quote`, `escape`, `streaming`, etc.). If unsure, `WebFetch` `https://docs.mulesoft.com/dataweave/latest/dataweave-formats-<format>` and copy the table verbatim — never extrapolate.
+   - No **`as <Type> { default:`** — use **`(value default fallback) as Type`** (see Forbidden Patterns blocklist).
    - No hand-rolled parsers for CSV/JSON/XML — these always indicate `readUrl` is being called wrong.
 2. **Grep the edited XML files against the Forbidden Patterns blocklist** at the top of this rule. Concrete commands the agent should run (PowerShell):
 
@@ -255,6 +264,19 @@ DW parse errors take ~90 seconds to surface through the `mvn package → copy to
 
    # 2f. ${env.X} in YAML/XML (Mule does NOT read OS env vars — use -M-D system properties)
    Select-String -Path 'src/main/mule/*.xml','src/main/resources/*.yaml' -Pattern '\$\{env\.'
+
+   # 2g. Lambda / higher-order op inside <when expression="#[...]"> (Mule 4.11 AlertingSupport NPE)
+   Select-String -Path 'src/main/mule/*.xml' `
+     -Pattern '<when\s+expression="#\[[^"]*(\)\s*->|\bsome\b|\bevery\b|\bmap\s*\(|\bfilter\s*\(|\bupper\s*\(|\blower\s*\(|\sas\s+(String|Number|Boolean|Object|Date))'
+
+   # 2h. Invalid type-coercion metadata — `as String { default:` deploy fails at DW parse (Invalid input 'd'...)
+   Select-String -Path 'src/main/mule/*.xml' -Pattern 'as\s+\w+\s*\{\s*default\s*:'
+
+   # 2i. Inline #[...] containing write(...) without explicit `output` — runtime "Unable to infer output media type"
+   Select-String -Path 'src/main/mule/*.xml' -Pattern '#\[(?!\s*%dw)[^\]]*\bwrite\s*\('
+
+   # 2j. Strings::replace called with 3 args — runtime "Too many arguments (3) for function with parameters (arg0, arg1)"
+   Select-String -Path 'src/main/mule/*.xml' -Pattern '\breplace\s*\([^()]*,[^()]*,[^()]*\)'
    ```
 
    Any non-empty result is a deploy-blocker — fix before continuing. Skip individual greps only when the change clearly cannot have introduced that pattern (e.g. no `readUrl` was added).

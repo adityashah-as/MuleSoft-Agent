@@ -1,0 +1,228 @@
+---
+description: Mule 4 scheduled jobs — JOBS.md, Scheduler trigger, config-driven cadence, DLQ-style errors, Object Store watermarking, manual HTTP test flow
+globs: **/src/main/mule/**/*.xml,**/JOBS.md,**/config.yaml,**/scripts/smoke-test.ps1
+alwaysApply: false
+---
+
+# Mule 4 — Scheduled Jobs & Scheduler Flows
+
+Use this rule whenever the integration is **time-triggered** (poll / cron / batch sync), not request-response HTTP. It complements `mule-flow-generation.mdc`, `mule-api-docs.mdc`, and `mule-init-context.mdc` — those assume **HTTP APIs**; scheduled jobs follow the patterns below instead.
+
+---
+
+## 1. Documentation Paradigm — `JOBS.md` (not `API.md`)
+
+### Mandatory split
+
+| Deliverable | Use when |
+|---|---|
+| `API.md` | Synchronous REST (or SOAP) APIs exposed via `<http:listener>` |
+| **`JOBS.md`** | **Scheduled** integrations triggered by `<scheduler>` |
+
+When building or changing **only** scheduled job flows, the agent **MUST NOT** create or update `API.md`. It **MUST** create or update **`JOBS.md`** at the **project root** (same tier as `API.md` and `PROJECT_CONTEXT.md`).
+
+### Required contents of `JOBS.md`
+
+Each job section MUST document:
+
+1. **Schedule** — Quartz cron expression and/or fixed frequency; reference the **`config.yaml`** keys (see section 2 below), not raw literals copied from XML.
+2. **Data source(s)** — System(s), object/query/file path, and how the job selects rows (e.g. SOQL, JDBC `WHERE`, SFTP path pattern).
+3. **Destination(s)** — Where results land (Salesforce, DB, queue, file share, REST target).
+4. **Business logic** — High-level steps (validate → transform → load → notify), idempotency notes, and **watermark** semantics if used (§4).
+5. **Manual test hook** — HTTP path and method for the **developer-only** trigger flow (§5), including expected **200** response shape so `smoke-test.ps1` can assert it.
+6. **Operational notes** — `disallowConcurrentExecution`, timezone (UTC on CloudHub), cluster primary-node behavior (see section 6 below).
+
+After adding or changing a job, update **`PROJECT_CONTEXT.md`** §4 (API Inventory is for HTTP only): add a **“Scheduled jobs”** subsection or a dedicated table row pointing to the job name and `JOBS.md` section — do not list scheduler-only flows as REST paths.
+
+---
+
+## 2. Flow Architecture & Triggers
+
+### Scheduler-first (never HTTP-first for the production trigger)
+
+- The **canonical** job flow **MUST** begin with **`<scheduler>`** as the **message source** (first component in the flow). Do **not** attach `<http:listener>` to this flow.
+- Official requirement: **at least one processor** MUST follow `<scheduler>`; otherwise deployment fails with a flow-content validation error (`MuleRuntimeException` / incomplete flow content).
+
+### Configuration externalization — `config.yaml` only
+
+Scheduling parameters **MUST NOT** be hardcoded as fixed literals inside flow XML (except trivial examples in comments elsewhere — not in shipped flows).
+
+**Load** values via `<configuration-properties file="config.yaml"/>` (already in `global-configs.xml`) and reference them with **`${...}`** in the scheduler strategy:
+
+**Fixed frequency** (attributes align with Mule docs: `frequency`, `timeUnit`, optional `startDelay`; `timeUnit` is one of `MILLISECONDS`, `SECONDS`, `MINUTES`, `HOURS`, `DAYS`):
+
+```yaml
+# Example — nested keys become dot properties in Mule
+jobs:
+  syncAccounts:
+    frequency: 5
+    timeUnit: MINUTES
+    startDelay: 30
+```
+
+```xml
+<scheduler doc:name="Poll syncAccounts" disallowConcurrentExecution="true">
+  <scheduling-strategy>
+    <fixed-frequency
+      frequency="${jobs.syncAccounts.frequency}"
+      timeUnit="${jobs.syncAccounts.timeUnit}"
+      startDelay="${jobs.syncAccounts.startDelay}"/>
+  </scheduling-strategy>
+</scheduler>
+```
+
+**Cron** (Quartz syntax — six required fields + optional year; use `timeZone` for explicit zones — prefer **full** Java IDs such as `America/Los_Angeles`, not abbreviations like `PST`):
+
+```yaml
+jobs:
+  syncAccounts:
+    cron: "0 0 2 * * ?"
+    timeZone: "UTC"
+```
+
+```xml
+<scheduler doc:name="Cron syncAccounts" disallowConcurrentExecution="true">
+  <scheduling-strategy>
+    <cron expression="${jobs.syncAccounts.cron}" timeZone="${jobs.syncAccounts.timeZone}"/>
+  </scheduling-strategy>
+</scheduler>
+```
+
+### Concurrency
+
+- Use **`disallowConcurrentExecution="true"`** when a long-running job must not overlap (document skipped executions in `JOBS.md`; Mule logs `Execution skipped` when the previous run is still active).
+
+### Salesforce (and similar targets): batching vs loop DML
+
+Scheduled jobs that **load many rows** (file, DB, queue) and write to **Salesforce** should **default** to **batched** upsert/query/DML and **DataWeave in-memory joins** when practical — not a final design of **`<foreach>` → upsert/query/DML per row** for large N without an explicit trade-off documented in **`JOBS.md`** / **`PROJECT_CONTEXT.md`**. When a single list can exceed **200** rows, use **chunked** DML (`foreach` per chunk of ≤200), not one oversized connector call — see **`mule-salesforce.mdc`** §4 *Mandatory: chunk standard DML…* and *Batching vs per-row DML and queries (`foreach`)*.
+
+---
+
+## 3. Error Handling — No HTTP Semantics
+
+Scheduled jobs have **no API client**. Rules in `mule-flow-generation.mdc` that map errors to **HTTP status codes** and **`vars.httpStatus`** apply to **HTTP listener flows only**.
+
+### Prohibited in scheduler + job sub-flows
+
+- Do **not** set **`vars.httpStatus`**, **`vars.errorCode` / `vars.errorMessage`** for JSON error envelopes, or design handlers around **400/404/503**.
+- Do **not** rely on `<http:error-response>` — there is no listener on the scheduled flow.
+
+### Required patterns
+
+Use an **outer** `<error-handler>` on the scheduled flow (and/or wrapping `<try>` around risky sections) that:
+
+1. **Logs** at **ERROR** with flow name, correlation id if available, and **safe** error summary (never log secrets).
+2. Routes failure to one or more of:
+   - **Dead Letter Queue** — e.g. **JMS** / **Anypoint MQ** publish of a compact JSON payload `{ job, timestamp, errorType, message, optionalKey }` (DLQ destination is environment-specific — document queue/topic names in `PROJECT_CONTEXT.md`, not secrets).
+   - **Email / notification connector** — operational alert to on-call distribution (connector config in `global-configs.xml`).
+   - **`<logger level="ERROR" />`** — minimum baseline when no messaging infrastructure exists yet.
+
+Use **`<on-error-continue type="ANY">`** (or specific types first, then `ANY`) when the intent is to **handle and finish** the flow after DLQ/alert — typical for fire-and-forget jobs. Use **`<on-error-propagate>`** only when a deliberate rollback/wrap-and-rethrow strategy is required upstream.
+
+### Inner try-scope
+
+Connector-specific mapping (e.g. normalize Salesforce faults before logging) may still use `<try>` / localized handlers — but the **final** outcome for a scheduled job is **observability + DLQ**, not HTTP.
+
+### HTTP error-mapping rules do not apply here
+
+Do not apply `mule-flow-generation.mdc` patterns that set **`vars.httpStatus`** or shape **`{ code, message }`** JSON for clients. Scheduled flows are not HTTP APIs.
+
+---
+
+## 4. State Management — Watermarking (Object Store)
+
+Most recurring sync jobs need **incremental** extraction: “everything modified since last success.”
+
+### Connector & store
+
+- Use the **Object Store connector** (`xmlns:os` / `mule-objectstore-connector`) and define an **`<os:object-store>`** (persistent vs in-memory is environment-dependent — **persistent** for real deployments; see connector docs and `PROJECT_CONTEXT.md`).
+- MuleSoft’s documented pattern: **retrieve** → **query using watermark** → **process** → **store** updated watermark.
+
+### Retrieve (preserve payload)
+
+Use **`<os:retrieve>`** with **`target="watermark"`** (or similar) so the store does not destroy the incoming message. Provide **`<os:default-value>`** for the **first run** (e.g. epoch ISO instant or a agreed bootstrap date).
+
+### Query
+
+Use the watermark in SOQL / SQL / filter API — e.g. `LastModifiedDate > :wm`.
+
+### Store
+
+- **`failIfPresent="false"`** — allows updates after the first run.
+- **`failOnNullValue="false"`** — if the batch is empty and max timestamp is null, skip storing instead of failing.
+- Store the **high-water mark** from **processed data** when possible — e.g. `max(payload.*LastModifiedDate)` — per MuleSoft’s watermark example. If the design calls for storing **`now()`** at the end of a successful run instead, document the **risk** (may miss concurrent updates during the run) in `JOBS.md` and `PROJECT_CONTEXT.md` §10.
+
+### Transactional note
+
+Updating the watermark **before** successful downstream commit can cause **skipped records** on failure; updating **after** can cause **retries/duplicates**. Prefer aligning watermark commit with **successful** target writes, or use idempotent upserts — document the chosen semantics.
+
+---
+
+## 5. Local Testability — Sub-flow + Manual HTTP Flow
+
+### Business logic in a **sub-flow**
+
+- Implement the **entire** job body (retrieve watermark → query → transform → load → store watermark + notifications) in **`<sub-flow name="...">`** — naming: **`<feature>-<job-name>-sub-flow`** (e.g. `accounts-sync-from-db-sub-flow`).
+
+### Thin scheduler flow
+
+- The **scheduled** `<flow>` contains: `<scheduler>` → **`<flow-ref name="...-sub-flow"/>`** → any outer **error-handler** (§3).
+
+### Manual trigger flow (HTTP)
+
+Add a **second**, clearly named **`<flow>`** with:
+
+- `<http:listener>` on a **dedicated path** under `${http.basePath}` — e.g. **`GET ${http.basePath}/jobs/<job>/run`** (or POST if body needed — document in `JOBS.md`).
+- A **single** `<flow-ref>` to the **same** sub-flow as the scheduler.
+- **Success response** — simple JSON, e.g. `{ "status": "started" | "completed", "job": "..." }` or synchronous completion summary — whatever matches smoke assertions.
+- **Guardrails** — document in `JOBS.md`: optional **`enabled` flag** in `config.yaml` (e.g. `jobs.syncAccounts.manualTriggerEnabled: true`) wrapping the listener in a **choice** / separate config profile so production can disable the route; never expose unauthenticated triggers in prod without aligning with platform security.
+
+### Self-Test Gate interaction
+
+- **`scripts/smoke-test.ps1`** cannot invoke a **scheduler** directly. For job work, **extend** the smoke script with **one case per manual-trigger path** documented in **`JOBS.md`** (not `API.md`).
+- The agent **MUST** keep **`JOBS.md`**, the manual-trigger flow, and **`smoke-test.ps1`** in sync — same spirit as `API.md` + HTTP endpoints.
+
+See **`mule-flow-generation.mdc`** § Self-Test Gate — scheduled jobs subsection.
+
+### MUnit
+
+- By default MUnit **does not start** flow sources. To test a **scheduler** flow end-to-end, use **`<munit:enable-flow-sources>`** / **`enable-flow-source`** pointing at the scheduler flow name; use **`munit-tools:verify-call`** (often wrapped in **`until-successful`**) to assert processors ran — see MUnit “Testing a Flow with a Scheduler Source” and “Enable Flow Sources” in MuleSoft docs.
+- Prefer unit-testing the **sub-flow** with **`munit:set-event`** + **`flow-ref`** for fast, deterministic tests.
+
+---
+
+## 6. Platform Semantics (Stable Runtime Behavior)
+
+These points come from MuleSoft’s Scheduler documentation and change rarely:
+
+| Topic | Behavior |
+|---|---|
+| **Timezone** | Scheduler uses the **JVM/host** timezone **except CloudHub**, where it runs in **UTC** unless **`cron` `timeZone`** overrides. |
+| **Cluster / multi-worker** | Scheduler runs on **one** node only — the **primary** in a cluster; not every worker fires independently. |
+| **Back-pressure** | If the runtime cannot allocate resources for a trigger, that execution may be **skipped** (see execution engine back-pressure docs). |
+| **Cron engine** | Expressions are **Quartz**-compatible; field order: seconds, minutes, hours, day-of-month, month, day-of-week, optional year — plus Quartz special characters (`* ? - , / L W #`). |
+| **Minimum processors** | A flow whose only source is `<scheduler>` **must** have at least one additional processor after it. |
+
+---
+
+## 7. Checklist — Before Marking Job Work Complete
+
+- [ ] **`JOBS.md`** updated (not `API.md`) with schedule keys, sources, sinks, logic, manual path, ops notes.
+- [ ] **`config.yaml`** holds all cadence values; XML uses **`${...}`** only.
+- [ ] Scheduled flow starts with **`<scheduler>`**; business logic in **sub-flow**; **manual HTTP** flow calls the same sub-flow.
+- [ ] **No `vars.httpStatus`** / HTTP-oriented error mapping on job paths.
+- [ ] **Error handler** logs ERROR + DLQ/email (or documented interim logger-only).
+- [ ] **Object Store** watermark pattern documented; retrieve uses **`target`** + default; store uses **`failIfPresent` / `failOnNullValue`** as appropriate.
+- [ ] **`smoke-test.ps1`** includes the manual trigger case(s); **`PROJECT_CONTEXT.md`** updated.
+- [ ] **Salesforce (or similar):** for **high-volume** loads, **`JOBS.md`** / **`PROJECT_CONTEXT.md`** reflects **batched** or **chunked (≤200)** DML/query (or delta) — not **only** per-row `foreach` DML without a documented trade-off (see **`mule-salesforce.mdc`** §4).
+
+---
+
+## Relationship to Other Rules
+
+| Rule file | Interaction |
+|---|---|
+| `mule-flow-generation.mdc` | HTTP listener / `vars.httpStatus` / API error envelopes — **skip** for pure scheduled flows; follow **sub-flow naming**, `doc:name`, choice-predicate guidance for transforms. |
+| `mule-api-docs.mdc` | **Do not** use for scheduler-only work — use **`JOBS.md`**. |
+| `mule-init-context.mdc` | Log new jobs + connectors in **PROJECT_CONTEXT.md**; never guess DLQ / queue names. |
+| `mule-salesforce.mdc` / `mule-database.mdc` | Query / upsert patterns inside the job **sub-flow**; Salesforce: **200-row DML chunking**, **batching vs per-row `foreach`** (§4). |

@@ -11,6 +11,12 @@
 
 ## Index
 
+### First-time setup
+
+| Doc | Purpose |
+|---|---|
+| [**`GETTING_STARTED.md`**](./GETTING_STARTED.md) | **Start here in Cursor:** prerequisites (Cursor → ACB → Maven), switching the extension marketplace to the VS Code gallery, which extensions to install, how `scripts/*.ps1` work and how to change them, running **Tasks**, and **manual CloudHub** deploy via Anypoint Code Builder. |
+
 ### Agent
 
 | Doc | Purpose |
@@ -19,15 +25,16 @@
 
 ### Helper Scripts (`scripts/`)
 
-All scripts live at `<project-root>/scripts/` and are wired into `.vscode/tasks.json` so they can be launched with one click via **Ctrl+Shift+P → Tasks: Run Task**.
+All scripts live at `<project-root>/scripts/` and are wired into `.vscode/tasks.json` so they can be launched with one click via **Ctrl+Shift+P → Tasks: Run Task**. Step-by-step behavior and customization are in [**`GETTING_STARTED.md` § 5–6**](./GETTING_STARTED.md#5-how-the-helper-scripts-work-and-how-to-change-them).
 
-| Doc | Script | Task label |
-|---|---|---|
-| [`scripts/run-mule.md`](./scripts/run-mule.md) | `scripts/run-mule.ps1` | **Mule: Run (Cursor)** |
-| [`scripts/stop-mule.md`](./scripts/stop-mule.md) | `scripts/stop-mule.ps1` | **Mule: Stop** |
-| [`scripts/test-sfdc-login.md`](./scripts/test-sfdc-login.md) | `scripts/test-sfdc-login.ps1` | **Salesforce: Test login (.env)** |
+| Script | Task label |
+|---|---|
+| `scripts/run-mule.ps1` | **Mule: Run (Cursor)** |
+| `scripts/stop-mule.ps1` | **Mule: Stop** |
+| `scripts/test-sfdc-login.ps1` | **Salesforce: Test login (.env)** |
+| `scripts/smoke-test.ps1` | **Mule: Smoke test** |
 
-> The project also ships `scripts/smoke-test.ps1` (task **Mule: Smoke test**) which is generated/maintained by the agent from `API.md`. It isn't documented here as a standalone script because it is a project-specific artifact, not generic tooling — its assertions live and breathe with the API surface. See [`../API.md`](../API.md) for the contract it tests.
+> **`smoke-test.ps1`** is maintained against `API.md` where the project defines HTTP APIs. See [`../API.md`](../API.md) for the contract it tests.
 
 ---
 

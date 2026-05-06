@@ -8,6 +8,60 @@ alwaysApply: false
 
 The Mule Salesforce connector (`mule-salesforce-connector`) supports SOAP, REST, Bulk API, Streaming API, and Composite API against any Salesforce org (Sandbox or Production).
 
+## 0. XML Namespace Prefix — MANDATORY
+
+The Salesforce connector's XML namespace is `http://www.mulesoft.org/schema/mule/salesforce`. The agent MUST alias this namespace as **`salesforce:`** in every Mule XML file — never `sfdc:`.
+
+```xml
+<!-- RIGHT — every project file uses the same prefix -->
+xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+
+<salesforce:sfdc-config name="Salesforce_Dev_config">
+  <salesforce:basic-connection .../>
+</salesforce:sfdc-config>
+
+<salesforce:create config-ref="Salesforce_Dev_config" type="Account">
+  <salesforce:records>#[payload]</salesforce:records>
+</salesforce:create>
+```
+
+```xml
+<!-- WRONG — older/Mule-3-era prefix; trips ACB language-server "unknown / disabled"
+     warnings in Cursor and creates cross-file lint errors when one file uses
+     'sfdc:' while another uses 'salesforce:' -->
+xmlns:sfdc="http://www.mulesoft.org/schema/mule/salesforce"
+<sfdc:sfdc-config ...>
+<sfdc:create ...>
+```
+
+### Why this matters
+
+- **The XML prefix is just a local alias** for the namespace URI — at runtime, Mule resolves by URI + element local-name, so `sfdc:create` and `salesforce:create` are functionally identical. **But** ACB / Cursor's XML language server does **prefix-string matching** on `config-ref` validation. When one file declares `<sfdc:sfdc-config name="X">` and another references it via `<salesforce:create config-ref="X">`, the linter throws `Configuration type reference is not compatible (connection config)` even though deploy + runtime are fine. Keeping ALL files on the same prefix is the only way to keep the lint clean.
+- **`salesforce:` is the canonical Mule 4 prefix.** Modern MuleSoft documentation, ACB code-completion, and the connector's own examples use it. `sfdc:` is a legacy carry-over from Mule 3 (`mule-module-sfdc`). Cursor's XML language server preferentially recognizes the `salesforce:` alias.
+- **Element local-names stay identical** when the prefix changes: `<salesforce:sfdc-config>` (yes, the local-name `sfdc-config` is from the XSD — that doesn't change), `<salesforce:salesforce-query>`, `<salesforce:basic-connection>`, etc. Only the prefix before the colon is renamed.
+
+### What is NOT renamed
+
+These are property names (matching `.env` and JVM `-M-D` flags), NOT XML prefixes — leave them as-is:
+- `${sfdc.username}`, `${sfdc.password}`, `${sfdc.token}`, `${sfdc.url}` — placeholders in `global-configs.xml`
+- `sfdc.username` / `sfdc.password` / `sfdc.token` keys in `.env`, `.env.example`, `scripts/run-mule.ps1` `-M-D…` lines
+- `SFDC_USERNAME` / `SFDC_PASSWORD` etc. — environment variable names
+
+The rule of thumb: **`sfdc` followed by `:` (XML prefix delimiter) is forbidden. `sfdc` followed by `.` (property name dot) or `_` (env var underscore) is fine.**
+
+### Migrating an existing project
+
+If an existing project still uses `sfdc:` prefix anywhere, migrate ALL files in one pass — never partially. Do this in three files at minimum:
+
+1. `src/main/mule/global-configs.xml` — change `xmlns:sfdc="…"` → `xmlns:salesforce="…"`, then every `sfdc:` element rename (`sfdc:sfdc-config` → `salesforce:sfdc-config`, `sfdc:basic-connection` → `salesforce:basic-connection`, etc.).
+2. Every `<feature>-api.xml` flow file that uses the connector — same two-step rename.
+3. Every MUnit test file under `src/test/munit/` — same two-step rename.
+
+After migration:
+- Run `ReadLints` on the changed files; the cross-prefix `Configuration type reference is not compatible` errors should be gone.
+- Add a row to `PROJECT_CONTEXT.md` § 10 Decisions Log with the date and "migrated Salesforce XML prefix from sfdc: to salesforce: across all flow + config + test files".
+- Smoke-test all endpoints (`scripts/smoke-test.ps1`) — no behavior change is expected, but the Self-Test Gate rule still applies.
+
 ## 1. Add Dependency
 
 In `pom.xml`:
@@ -27,13 +81,13 @@ Salesforce supports several auth flows. Pick ONE per org:
 
 ### Username + Password + Security Token (simplest, dev/test)
 ```xml
-<sfdc:sfdc-config name="Salesforce_Org_config" doc:name="Salesforce Org">
-  <sfdc:basic-connection
+<salesforce:sfdc-config name="Salesforce_Org_config" doc:name="Salesforce Org">
+  <salesforce:basic-connection
       username="${sfdc.username}"
       password="${sfdc.password}"
       securityToken="${sfdc.token}"
       url="${sfdc.url}"/>
-</sfdc:sfdc-config>
+</salesforce:sfdc-config>
 ```
 
 ### CRITICAL: pick the right login endpoint per org type
@@ -52,20 +106,20 @@ Never hardcode the URL in `global-configs.xml` — put it in `config.yaml` as `s
 
 ### OAuth JWT Bearer (recommended for prod / server-to-server)
 ```xml
-<sfdc:sfdc-config name="Salesforce_Prod_config" doc:name="Salesforce Prod">
-  <sfdc:oauth-jwt-connection
+<salesforce:sfdc-config name="Salesforce_Prod_config" doc:name="Salesforce Prod">
+  <salesforce:oauth-jwt-connection
       consumerKey="${sfdc.consumerKey}"
       keyStore="keystores/sfdc.jks"
       storePassword="${sfdc.storePassword}"
       principal="${sfdc.principal}"
       audienceUrl="https://login.salesforce.com"/>
-</sfdc:sfdc-config>
+</salesforce:sfdc-config>
 ```
 
 ## 3. `config.yaml` Properties
 
 ```yaml
-sfdc:
+salesforce:
   username: "integration@acme.com.sandbox"
   # password and token live in env vars or secure-properties — NEVER here
 ```
@@ -81,64 +135,130 @@ See `mule-init-context.mdc` "CRITICAL Mule Property Resolution Gotcha" for full 
 
 ### Insert (Create) — single record
 ```xml
-<sfdc:create config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Create Account">
-  <sfdc:records>#[[{
+<salesforce:create config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Create Account">
+  <salesforce:records>#[[{
     Name: payload.name,
     Industry: payload.industry default "Other",
     BillingCity: payload.city
-  }]]</sfdc:records>
-</sfdc:create>
+  }]]</salesforce:records>
+</salesforce:create>
 ```
 **Result shape**: see §5 — the connector returns `{ successful, items: [{ successful, id, payload: { success, id, errors }, ... }] }`. Read results from `payload.items[0]`, NOT `payload[0]`. The §7 pattern shows the correct success/error extraction.
 
 ### Insert — multiple records
 ```xml
-<sfdc:create config-ref="Salesforce_Sandbox_config" type="Contact" doc:name="Create Contacts">
-  <sfdc:records>#[payload map { FirstName: $.firstName, LastName: $.lastName, Email: $.email, AccountId: vars.accountId }]</sfdc:records>
-</sfdc:create>
+<salesforce:create config-ref="Salesforce_Sandbox_config" type="Contact" doc:name="Create Contacts">
+  <salesforce:records>#[payload map { FirstName: $.firstName, LastName: $.lastName, Email: $.email, AccountId: vars.accountId }]</salesforce:records>
+</salesforce:create>
 ```
 
 ### Upsert (insert-or-update by external Id)
+
+**CRITICAL (XSD / `mvn package`):** `<salesforce:upsert>` is **not** the same as create/update. The Salesforce connector schema requires **`objectType`** for the SObject name on upsert. Using **`type`** here fails Maven `process-classes` with:
+
+- `Attribute 'type' is not allowed to appear in element 'salesforce:upsert'`
+- `Attribute 'objectType' must appear on element 'salesforce:upsert'`
+
+Keep using **`type`** on `<salesforce:create>`, `<salesforce:update>`, bulk ops, etc. Only upsert uses **`objectType`**.
+
 ```xml
-<sfdc:upsert config-ref="Salesforce_Sandbox_config"
-             type="Account"
+<salesforce:upsert config-ref="Salesforce_Sandbox_config"
+             objectType="Account"
              externalIdFieldName="External_Id__c"
              doc:name="Upsert Account">
-  <sfdc:records>#[[{ External_Id__c: payload.externalId, Name: payload.name }]]</sfdc:records>
-</sfdc:upsert>
+  <salesforce:records>#[[{ External_Id__c: payload.externalId, Name: payload.name }]]</salesforce:records>
+</salesforce:upsert>
 ```
 
 ### Update — by Salesforce Id
 ```xml
-<sfdc:update config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Update Account">
-  <sfdc:records>#[[{ Id: vars.accountId, Industry: payload.industry }]]</sfdc:records>
-</sfdc:update>
+<salesforce:update config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Update Account">
+  <salesforce:records>#[[{ Id: vars.accountId, Industry: payload.industry }]]</salesforce:records>
+</salesforce:update>
 ```
 
 ### Delete
 ```xml
-<sfdc:delete config-ref="Salesforce_Sandbox_config" doc:name="Delete Account">
-  <sfdc:ids>#[[vars.accountId]]</sfdc:ids>
-</sfdc:delete>
+<salesforce:delete config-ref="Salesforce_Sandbox_config" doc:name="Delete Account">
+  <salesforce:ids>#[[vars.accountId]]</salesforce:ids>
+</salesforce:delete>
 ```
 
 ### Query (SOQL)
 ```xml
-<sfdc:query config-ref="Salesforce_Sandbox_config" doc:name="Query top accounts">
-  <sfdc:salesforce-query>SELECT Id, Name, Industry FROM Account WHERE Industry = ':industry' LIMIT 50</sfdc:salesforce-query>
-  <sfdc:parameters>#[{ industry: vars.industry }]</sfdc:parameters>
-</sfdc:query>
+<salesforce:query config-ref="Salesforce_Sandbox_config" doc:name="Query top accounts">
+  <salesforce:salesforce-query>SELECT Id, Name, Industry FROM Account WHERE Industry = ':industry' LIMIT 50</salesforce:salesforce-query>
+  <salesforce:parameters>#[{ industry: vars.industry }]</salesforce:parameters>
+</salesforce:query>
 ```
+
+### Query — `IN` with a **list** of values (dynamic keys)
+
+**Do not** pass a Java/Array `List` to a single bound parameter (e.g. `WHERE MyField IN :keys` and `#[{ keys: vars.someArray }]`) unless you have confirmed your connector version maps it correctly. Many deployments throw:
+
+`Unable to convert 'Array' to class 'java.lang.String'` (or similar) when the driver expects a **String** (or a different bind shape) for that placeholder.
+
+**Preferred pattern** — build the `IN` clause in DataWeave with **single-quoted**, **comma-separated** literals and escape embedded apostrophes per SOQL (`'` → `''`):
+
+```dw
+fun escapeSoqlQuotes(s) = (s as String splitBy "'") joinBy "''"
+var keys = vars.categoryKeys default []
+var obj = vars.sfCategoryObjectType default ""
+var inList = (keys map ((k) -> "'" ++ escapeSoqlQuotes(k) ++ "'")) joinBy ", "
+---
+"SELECT Id, Import_Key__c FROM " ++ obj ++ " WHERE Import_Key__c IN (" ++ inList ++ ")"
+```
+
+(`dw::core::Strings` **`replace`** is not a 3-argument substring replace in all DW versions — use **`splitBy "'" joinBy "''"`** for SOQL single-quote escaping.)
+
+Use that string as the **only** `<salesforce:salesforce-query>` body — **no** `<salesforce:parameters>` for `keys`. Treat keys as untrusted unless they come from a strictly validated vocabulary (still escape `'`).
+
+### Batching vs per-row DML and queries (`foreach`)
+
+**Purpose:** Reduce **API calls**, runtime, and load on Salesforce **per-record** automation (triggers, flows). This is a **design guideline** — not a hard ban on `<foreach>`.
+
+**Prefer (especially when row count N is large or the job runs frequently):**
+
+- Build a **list** of SObject maps, then **one** (or **chunked**) `<salesforce:upsert>` / `create` / `update` with **many** rows in `<salesforce:records>` instead of **one connector DML per iteration**. Chunk (e.g. 200 rows) if you hit connector or platform limits.
+- **Batch SOQL:** e.g. `WHERE Import_Key__c IN ('a','b',…)` for **distinct** keys from the batch — **not** a separate `query` per row. Chunk `IN` clauses to stay within **SOQL length** and **query row** limits.
+- **In-memory join (DataWeave):** merge batched query results with the working payload (e.g. category Id by key, existing junction Ids) **before** issuing **batched** junction `create` / `update`.
+- **Very large** volumes: prefer **Bulk API** operations (see Bulk Insert above) where appropriate.
+
+**Per-row `<foreach>` that contains `salesforce:query` / `create` / `update` / `upsert` is acceptable when:**
+
+- **N is small** (roughly **tens**; above **~50–200** re-evaluate; above **~500** strongly prefer batching), **or**
+- **Business rules** require a **separate transaction** per record, **or**
+- **Low-frequency** or **prototype** flows where simplicity is explicitly traded for API cost — document in **`JOBS.md`** (scheduled jobs) and/or **`PROJECT_CONTEXT.md`** §10.
+
+**Scheduled syncs:** See **`mule-scheduler-jobs.mdc`** — agents should **not** treat "loop + DML every row" as the default finished design for **high-volume** file/DB loads without noting cost and **preferring** batching, **delta/watermark**, or **Bulk API**.
+
+### Mandatory: chunk standard `upsert` / `create` / `update` lists at the SOAP 200-record ceiling
+
+Salesforce documents the SOAP **`upsert()`** **`sObjects`** argument as an array with a **maximum of 200** records per call ([`upsert()` — Arguments](https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_calls_upsert.htm)). The same **200** ceiling applies to other synchronous composite/collection DML patterns your connector may use under the hood.
+
+The Mule **`Upsert`** operation reference describes a **list** of records; it does **not** promise to split oversized lists into multiple API calls for you ([Salesforce Connector — Upsert](https://docs.mulesoft.com/connectors/salesforce/salesforce-connector-reference#upsert)).
+
+**Agents MUST** when a flow can send **more than 200** rows in one logical batch:
+
+1. Add a **`config.yaml`** scalar (quoted string) for chunk size — e.g. `job.<jobName>.salesforceBatchSize: "200"` — and read it in DataWeave via `p("job.<jobName>.salesforceBatchSize")` (fallback **200**; if parsed size is below **1**, clamp to **200**).
+2. Split the SObject list in DataWeave into **ordered** sub-arrays of **at most** that size (recursive slice pattern, e.g. `toBatches`).
+3. Use **`<foreach collection="…">`** (one iteration **per chunk**, not per row) around `<salesforce:upsert>` / `create` / `update`, with **`salesforce:records` bound to the chunk** (`#[payload]` inside the scope).
+4. **Merge** `(payload.items default [])` from each connector response **in order** into a single array (e.g. `vars.accumulated…Items`) **before** zipping with the original source rows or computing global success/failure counts.
+5. Log batch count + merged record count at **INFO**; update **`JOBS.md`** / **`PROJECT_CONTEXT.md`** when changing scheduled jobs.
+
+**Do not** rely on undocumented connector auto-chunking. For **very large** loads (tens of thousands+), prefer **Bulk API** job operations and document trade-offs in **`JOBS.md`**.
+
+**Chunked `<foreach>`** (≤200 rows per iteration) is the standard compromise: it respects the platform limit while keeping **O(N/200)** connector calls instead of **N** per-row calls.
 
 ### Bulk Insert (10K+ records)
 ```xml
-<sfdc:create-bulk config-ref="Salesforce_Sandbox_config" type="Contact" doc:name="Bulk insert Contacts">
-  <sfdc:records>#[payload]</sfdc:records>
-</sfdc:create-bulk>
+<salesforce:create-bulk config-ref="Salesforce_Sandbox_config" type="Contact" doc:name="Bulk insert Contacts">
+  <salesforce:records>#[payload]</salesforce:records>
+</salesforce:create-bulk>
 ```
-Use Bulk for > ~2000 records. Returns a `jobId` you can poll with `<sfdc:get-job-info>` and `<sfdc:get-batch-result>`.
+Use Bulk for > ~2000 records. Returns a `jobId` you can poll with `<salesforce:get-job-info>` and `<salesforce:get-batch-result>`.
 
-## 5. The ACTUAL response shape from `sfdc:create` / `sfdc:update` / `sfdc:upsert`
+## 5. The ACTUAL response shape from `salesforce:create` / `salesforce:update` / `salesforce:upsert`
 
 The Mule SF connector returns a **BatchOperationResult** — NOT a flat `SaveResult` array. This is the most common cause of "my success check doesn't fire" or "I get 'no errors[]' even though SF rejected the record". Verified shape:
 
@@ -170,12 +290,14 @@ The Mule SF connector returns a **BatchOperationResult** — NOT a flat `SaveRes
 ## 6. MUST Rules
 
 - **One global config per org** (Sandbox vs Prod), reused across all flows.
-- **Always set `type` attribute** on create/update/upsert/delete so the connector knows the SObject.
-- **The `<sfdc:records>` payload MUST be a list `[{...}]`**, even for a single record. Wrap with `[ ... ]`.
+- **Set the SObject on each operation:** use **`type`** on `<salesforce:create>`, `<salesforce:update>`, `<salesforce:delete>`, bulk operations, etc. Use **`objectType`** on `<salesforce:upsert>` only (see §4 Upsert — XSD requires this name).
+- **The `<salesforce:records>` payload MUST be a list `[{...}]`**, even for a single record. Wrap with `[ ... ]`.
 - **Read results from `payload.items[N]`**, NOT `payload[N]`. See response shape above.
 - **Treat `items[N].successful != true`** as a failure. Pull `items[N].payload.errors[0].statusCode` + `.message` + `.fields` for diagnostics.
 - **NEVER hard-code credentials** in XML. Use `${...}` properties bound to env vars or secure-properties.
 - **Test the connection** in ACB: open `global-configs.xml` → click the Salesforce config → "Test Connection".
+- **Lists over ~200 rows:** chunk synchronous `upsert` / `create` / `update` per §4 *Mandatory: chunk standard DML…*; merge `payload.items` in source order before zipping with inputs.
+- **Prefer batching over per-row DML** in `<foreach>` for non-trivial N — see §4 *Batching vs per-row DML and queries (`foreach`)*.
 
 ## 7. User-Friendly Error Responses — MANDATORY pattern
 
@@ -295,7 +417,7 @@ output application/java
     </ee:message>
   </ee:transform>
 
-  <sfdc:create config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Create Account"/>
+  <salesforce:create config-ref="Salesforce_Sandbox_config" type="Account" doc:name="Create Account"/>
 
   <choice doc:name="Check SF result">
     <when expression="#[((payload.items default [])[0].successful default false) == true]">
