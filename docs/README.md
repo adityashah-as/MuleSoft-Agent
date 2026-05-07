@@ -1,7 +1,6 @@
 # Project Documentation
 
-> Internal docs for the **Product Price API** — a MuleSoft 4 project developed in Anypoint Code Builder / Cursor.
->
+
 > This folder explains the *machinery around the code*: how the AI agent is configured, and what every helper PowerShell script under `scripts/` actually does.
 >
 > For the **API surface** itself (endpoints, request/response shapes, demo calls) see [`../API.md`](../API.md).
